@@ -3,3 +3,4 @@ target/
 Cargo.lock
 __pycache__/
 /rust-project.json
+.vscode/
