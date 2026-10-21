@@ -35,3 +35,13 @@ pub const PHYS_DRAM_SIZE: usize = 0xefe0_0000;
 
 // Offset from the 2MiB-aligned base, published in the arm64 Image header.
 pub const TEXT_OFFSET: usize = blueos_kconfig::CONFIG_KERNEL_PHYS_BASE as usize % (2 * 1024 * 1024);
+
+// FIXME: The following memory banks are hardcoded for now. In the future, we should
+//        parse the memory banks from the device tree or firmware-provided memory map.
+//        This will be different for each board, so we should move this to the board-specific config file.
+pub const MemoryBanks: [crate::mm::memory_bank::MemoryBank; 1] = [
+    crate::mm::memory_bank::MemoryBank {
+        start: PhysicalAddress::new(0x20_0000),
+        end: PhysicalAddress::new(0xeced_affff),
+    },
+];
