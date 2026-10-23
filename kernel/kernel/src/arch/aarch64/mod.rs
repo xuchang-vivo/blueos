@@ -19,6 +19,8 @@ pub(crate) mod mmu;
 pub(crate) mod psci;
 pub(crate) mod vector;
 pub(crate) mod virt;
+#[cfg(paging)]
+pub(super) mod page_format;
 
 use crate::{mm::VirtualAddress, scheduler};
 use aarch64_cpu::{

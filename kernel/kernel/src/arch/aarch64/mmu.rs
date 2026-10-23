@@ -41,8 +41,7 @@
 // ============================================================================
 
 use crate::{
-    arch::aarch64::asm,
-    mm::{PhysicalAddress, VirtualAddress},
+    arch::aarch64::asm, mm::{PhysicalAddress, VirtualAddress, paging::PageFormat},
 };
 use aarch64_cpu::{
     asm::{
@@ -57,6 +56,11 @@ use core::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use tock_registers::{interfaces::*, register_bitfields, registers::InMemoryRegister};
+
+#[cfg(aarch64_va_bits_39)]
+use super::page_format::A64_4K_39 as PAGE_FORMAT;
+#[cfg(aarch64_va_bits_48)]
+use super::page_format::A64_4K_48 as PAGE_FORMAT;
 
 const L1_BLOCK_SIZE: u64 = 1 << 30;
 const PAGE_SIZE: usize = 4096;
@@ -286,11 +290,11 @@ static mut TABLE_MANAGER: PageTableManager = PageTableManager::new();
 static mut LINEARMAP_MANAGER: PageTableManager = PageTableManager::new();
 
 #[repr(C, align(4096))]
-pub struct PageTableManager([PageEntry; 512]);
+pub struct PageTableManager([PageEntry; 512], &'static PageFormat);
 
 impl PageTableManager {
     const fn new() -> Self {
-        PageTableManager([PageEntry::new(); 512])
+        PageTableManager([PageEntry::new(); 512], &PAGE_FORMAT)
     }
 
     fn init() {
