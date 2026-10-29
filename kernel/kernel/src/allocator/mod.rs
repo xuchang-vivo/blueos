@@ -14,6 +14,9 @@
 
 extern crate alloc;
 
+#[cfg(all(paging, allocator_buddy))]
+compile_error!("paging and the independent buddy physical allocator cannot manage the same RAM");
+
 use crate::{
     mm::{kernel_phys_to_virt, kernel_virt_to_phys, PhysicalAddress, VirtualAddress},
     static_arc,

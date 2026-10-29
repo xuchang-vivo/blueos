@@ -35,6 +35,7 @@ config SLAB_DYNAMIC_MAX_TOTAL_PAGES
 
 config ALLOCATOR_BUDDY
     bool "Enable buddy allocator as physical page manager"
+    depends on !PAGING
     default n
     help
         Enable the buddy allocator to manage all physical memory pages.
@@ -44,3 +45,16 @@ config ALLOCATOR_BUDDY
         page pools; >= PAGE_SIZE allocations go directly to buddy;
         tlsf/llff keep their original __heap_start~__heap_end path.
         When disabled, the kernel falls back to direct heap management.
+        Paging uses its shared frame allocator instead; the independent buddy
+        initialization must not manage the same physical pages.
+
+config KERNEL_HEAP_SIZE_KB
+    int "Kernel heap size in KiB"
+    depends on PAGING
+    range 4 1048576
+    default 16384
+    help
+        Physical backing reserved for the fixed kernel heap on paging systems.
+        Remaining frames stay available for page tables and user memory.
+        The size must be a multiple of the page size. Boot fails if the heap
+        cannot be backed contiguously while leaving runtime frames available.

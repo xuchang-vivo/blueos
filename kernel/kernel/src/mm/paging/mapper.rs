@@ -14,8 +14,9 @@
 
 //! Builds page tables using architecture-provided descriptors and frame allocation.
 //!
-//! Tables are retained for the allocator's lifetime. Build mappings before
-//! installing the root; modifying active tables requires a separate TLB protocol.
+//! Inactive tables are reclaimed on drop, including partially built trees.
+//! Call `retain_tables` before installing a root in hardware. Modifying active
+//! tables requires a separate TLB protocol.
 
 use super::{FrameAllocator, PageFormat};
 use crate::mm::{
@@ -23,8 +24,10 @@ use crate::mm::{
 };
 use core::{marker::PhantomData, mem::size_of};
 
+#[must_use = "dropping an inactive mapper releases its page tables"]
 pub struct PageMapper<F: FrameAllocator, P: PageFormat = crate::arch::page::PageEntry> {
     root_addr: usize,
+    owns_tables: bool,
     allocator: F,
     format: PhantomData<P>,
 }
@@ -47,11 +50,20 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
         }
         let mut mapper = Self {
             root_addr: 0,
+            owns_tables: false,
             allocator,
             format: PhantomData,
         };
         mapper.root_addr = mapper.allocate_table()?;
+        mapper.owns_tables = true;
         Ok(mapper)
+    }
+
+    /// Keep the table tree permanently allocated, even when this mapper drops.
+    /// Call before installing the root on any CPU. This does not manage mapped
+    /// data pages; their owner must separately guarantee their lifetime.
+    pub fn retain_tables(&mut self) {
+        self.owns_tables = false;
     }
 
     pub fn root_address(&self) -> PhysicalAddress {
@@ -65,6 +77,9 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
             .ok_or("out of page-table frames")?
             .into_raw();
         if addr & (P::PAGE_SIZE - 1) != 0 || addr >= (1usize << P::PHYS_ADDR_BITS) {
+            // SAFETY: the unpublished allocation has no users.
+            unsafe { self.allocator.free_frame(PhysicalAddress::new(addr)) }
+                .expect("failed to return an unusable page-table frame");
             return Err("invalid page-table frame");
         }
         let table = kernel_phys_to_virt(PhysicalAddress::new(addr)).into_raw() as *mut u8;
@@ -95,7 +110,7 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
         let mut table = self.root_addr;
         for level in 0..P::LEVELS {
             let entry = Self::entry_ptr(table, va, level).ok()?;
-            // SAFETY: tables belong to this mapper and are never freed.
+            // SAFETY: tables remain live while this mapper is borrowed.
             let entry = unsafe { entry.read() };
             if level == P::LEVELS - 1 {
                 return P::is_valid(entry).then_some(entry);
@@ -214,5 +229,31 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
             };
         }
         Ok(())
+    }
+}
+
+impl<F: FrameAllocator, P: PageFormat> Drop for PageMapper<F, P> {
+    fn drop(&mut self) {
+        if self.owns_tables {
+            // SAFETY: these tables have not been published to hardware. Only
+            // child tables are released; leaf backing belongs to the caller.
+            unsafe { self.release_table(self.root_addr, 0) };
+        }
+    }
+}
+
+impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
+    unsafe fn release_table(&mut self, table: usize, level: u8) {
+        if level + 1 < P::LEVELS {
+            let entries =
+                kernel_phys_to_virt(PhysicalAddress::new(table)).into_raw() as *const usize;
+            for index in 0..P::PAGE_SIZE / size_of::<usize>() {
+                if let Some(child) = P::table_address(unsafe { entries.add(index).read() }) {
+                    unsafe { self.release_table(child, level + 1) };
+                }
+            }
+        }
+        unsafe { self.allocator.free_frame(PhysicalAddress::new(table)) }
+            .expect("invalid page-table frame during cleanup");
     }
 }

@@ -18,7 +18,11 @@ use super::{
     address_space::Vma,
     kernel_phys_to_virt,
     memory_bank::MemoryBank,
-    paging::{first_fit::FirstFitFrameAllocator, mapper::PageMapper, FrameAllocator, PageFormat},
+    paging::{
+        first_fit::{FirstFitFrameAllocator, FrameAllocation},
+        mapper::PageMapper,
+        PageFormat,
+    },
     CachePolicy, MemAttribute, MemFlags, MemType, PhysicalAddress,
 };
 use crate::{arch::page::PageEntry, mm::VirtualAddress};
@@ -29,8 +33,10 @@ const REGION_COUNT: usize = 9 + crate::boards::MEMORY_BANKS.len();
 
 static KERNEL_SPACE: Once<KernelAddressSpace> = Once::new();
 
+#[must_use]
 pub struct KernelAddressSpace {
     regions: [Option<Vma>; REGION_COUNT],
+    heap_backing: Option<FrameAllocation<'static>>,
     mapper: PageMapper<&'static FirstFitFrameAllocator, PageEntry>,
 }
 
@@ -41,6 +47,13 @@ impl KernelAddressSpace {
 
     pub fn root_address(&self) -> PhysicalAddress {
         self.mapper.root_address()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn heap_physical_range(&self) -> (usize, usize) {
+        let backing = self.heap_backing.as_ref().unwrap();
+        let start = backing.address().into_raw();
+        (start, start + backing.count() * PageEntry::PAGE_SIZE)
     }
 
     pub fn find_region(&self, addr: usize) -> Option<Vma> {
@@ -117,27 +130,26 @@ impl KernelAddressSpace {
     }
 
     fn map_heap(&mut self, start: VirtualAddress) -> Result<usize, &'static str> {
-        let mut allocator = FirstFitFrameAllocator::instance();
-        let max_pages = allocator
+        let allocator = FirstFitFrameAllocator::instance();
+        let len = (blueos_kconfig::CONFIG_KERNEL_HEAP_SIZE_KB as usize)
+            .checked_mul(1024)
+            .filter(|len| *len != 0 && *len & (PageEntry::PAGE_SIZE - 1) == 0)
+            .ok_or("kernel heap size must be a nonzero page multiple")?;
+        // Prepare tables before reserving the contiguous heap run. Both tables
+        // and backing are reclaimed if constructing this inactive space fails.
+        self.mapper.prepare_range(start, len)?;
+        let pages = len / PageEntry::PAGE_SIZE;
+        if allocator
             .usage()
             .ok_or("frame allocator is not initialized")?
-            .free();
-        let max_len = max_pages
-            .checked_mul(PageEntry::PAGE_SIZE)
-            .ok_or("kernel heap size overflow")?;
-        // Allocate table frames first. Every free frame left afterwards belongs
-        // to the heap, so mapping the backing pages must need no further frames.
-        self.mapper.prepare_range(start, max_len)?;
-        let pages = allocator
-            .usage()
-            .ok_or("frame allocator is not initialized")?
-            .free();
-        if pages == 0 {
-            return Err("no physical memory remains for the kernel heap");
+            .free()
+            <= pages
+        {
+            return Err("kernel heap would exhaust runtime frames");
         }
-        let len = pages
-            .checked_mul(PageEntry::PAGE_SIZE)
-            .ok_or("kernel heap size overflow")?;
+        let backing = allocator
+            .alloc_owned_frames(pages)
+            .ok_or("out of contiguous kernel heap frames")?;
         let end = start
             .into_raw()
             .checked_add(len)
@@ -149,27 +161,16 @@ impl KernelAddressSpace {
             end,
             MemFlags::READ | MemFlags::WRITE | MemFlags::EXECUTE,
         )?;
-        let first =
-            FrameAllocator::alloc_frame(&mut allocator).ok_or("out of kernel heap frames")?;
-        // Reserve all heap frames before allocating any further page tables.
-        // This preserves physical contiguity required by existing DMA buffers.
-        for offset in (PageEntry::PAGE_SIZE..len).step_by(PageEntry::PAGE_SIZE) {
-            let frame = FrameAllocator::alloc_frame(&mut allocator)
-                .ok_or("out of kernel heap frames")?
-                .into_raw();
-            if first.into_raw().checked_add(offset) != Some(frame) {
-                return Err("kernel heap frames must be physically contiguous");
-            }
-        }
         self.mapper.map_range(
             start,
-            first,
+            backing.address(),
             len,
             MemAttribute {
                 flags: MemFlags::READ | MemFlags::WRITE | MemFlags::EXECUTE | MemFlags::GLOBAL,
                 memory_type: MemType::Normal(CachePolicy::WriteBack),
             },
         )?;
+        self.heap_backing = Some(backing);
         Ok(end)
     }
 
@@ -221,6 +222,7 @@ impl KernelAddressSpace {
         let mapper = unsafe { PageMapper::create(allocator)? };
         let mut space = Self {
             regions: [None; REGION_COUNT],
+            heap_backing: None,
             mapper,
         };
         let normal = MemType::Normal(CachePolicy::WriteBack);
@@ -253,6 +255,7 @@ impl KernelAddressSpace {
         // SAFETY: the new table covers the running kernel and the newly backed
         // heap. No heap allocations were needed to construct the static region
         // metadata or the page tables. Install before writing heap metadata.
+        space.mapper.retain_tables();
         unsafe { crate::arch::mmu::activate_kernel_table(space.root_address()) };
         crate::allocator::init_heap(heap_start as *mut u8, heap_end as *mut u8);
         Ok(space)
