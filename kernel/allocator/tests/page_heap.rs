@@ -496,3 +496,59 @@ fn slab_reuse_and_invalid_free_leave_allocation_unchanged() {
     }
     assert_eq!(f.free_pages(), 4);
 }
+
+#[test]
+fn charges_slots_and_pages_separately_and_retains_peak() {
+    let mut f = Fixture::new(4);
+    let layout = Layout::from_size_align(24, 8).unwrap();
+    let AllocationPlan::Slab(class) = classify(layout).unwrap() else {
+        panic!()
+    };
+    let slab = f.take(1, PAGE_SIZE).unwrap();
+    unsafe { PageHeap::format_slab(slab, class) }.unwrap();
+    let SlabCommit::Inserted(first) = (unsafe { f.heap.commit_slab(slab, class) }).unwrap() else {
+        panic!()
+    };
+    let second = f.heap.try_alloc_small(class).unwrap().unwrap();
+    assert_eq!(f.heap.stats().charged_bytes, 64);
+    assert_eq!(f.heap.stats().backing_bytes, PAGE_SIZE);
+    let span = f.take(3, PAGE_SIZE).unwrap();
+    let large_layout = Layout::from_size_align(8193, 8).unwrap();
+    let large = unsafe { f.heap.commit_large(span, large_layout) }.unwrap();
+    assert_eq!(f.heap.stats().charged_bytes, 64 + 3 * PAGE_SIZE);
+    assert_eq!(f.heap.stats().backing_bytes, 4 * PAGE_SIZE);
+    for (ptr, layout) in [
+        (first.ptr, layout),
+        (second.ptr, layout),
+        (large.ptr, large_layout),
+    ] {
+        if let ReleaseAction::Pages(span) = unsafe { f.heap.free(ptr, Some(layout)) }.unwrap() {
+            f.release(span);
+        }
+    }
+    assert_eq!(f.heap.stats().charged_bytes, 0);
+    assert_eq!(f.heap.stats().backing_bytes, 0);
+    assert_eq!(f.heap.stats().peak_charged_bytes, 64 + 3 * PAGE_SIZE);
+}
+
+#[test]
+fn free_slot_remains_available_when_source_has_no_pages() {
+    let mut f = Fixture::new(1);
+    let AllocationPlan::Slab(class) = classify(Layout::from_size_align(24, 8).unwrap()).unwrap()
+    else {
+        panic!()
+    };
+    let slab = f.take(1, PAGE_SIZE).unwrap();
+    unsafe { PageHeap::format_slab(slab, class) }.unwrap();
+    let SlabCommit::Inserted(first) = (unsafe { f.heap.commit_slab(slab, class) }).unwrap() else {
+        panic!()
+    };
+    assert_eq!(f.free_pages(), 0);
+    assert_eq!(f.heap.largest_free_slot(), 32);
+    let second = f.heap.try_alloc_small(class).unwrap().unwrap();
+    for ptr in [first.ptr, second.ptr] {
+        if let ReleaseAction::Pages(span) = unsafe { f.heap.free(ptr, None) }.unwrap() {
+            f.release(span);
+        }
+    }
+}

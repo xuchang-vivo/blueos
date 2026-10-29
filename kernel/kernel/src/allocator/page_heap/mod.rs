@@ -23,7 +23,15 @@ use allocator_crate::page_heap::{
 use core::{alloc::Layout, ptr::NonNull};
 
 use self::source::{FirstFitSource, PageSource, PendingPages};
-use crate::sync::SpinLock;
+use crate::{mm::paging::FrameStats, sync::SpinLock};
+
+pub(super) fn memory_info_from_frames(stats: FrameStats) -> allocator_crate::MemoryInfo {
+    allocator_crate::MemoryInfo {
+        total: (stats.total - stats.reserved) * PAGE_SIZE,
+        used: stats.allocated * PAGE_SIZE,
+        max_used: stats.peak_allocated * PAGE_SIZE,
+    }
+}
 
 pub struct PageHeap<P: PageSource = FirstFitSource> {
     state: SpinLock<Option<RawHeap<'static>>>,
@@ -271,6 +279,20 @@ impl<P: PageSource> PageHeap<P> {
             .as_ref()
             .and_then(|raw| raw.allocation_info(ptr).ok());
         result.map_or(0, |info| info.capacity)
+    }
+
+    pub fn memory_info(&self) -> allocator_crate::MemoryInfo {
+        memory_info_from_frames(self.source.frame_stats())
+    }
+
+    /// The heap and source snapshots are taken separately and may race with allocations.
+    pub fn get_max_free_block_size(&self) -> usize {
+        let slot = self
+            .state
+            .irqsave_lock()
+            .as_ref()
+            .map_or(0, RawHeap::largest_free_slot);
+        slot.max(self.source.largest_free_run_bytes())
     }
 
     pub fn heap_stats(&self) -> HeapStats {

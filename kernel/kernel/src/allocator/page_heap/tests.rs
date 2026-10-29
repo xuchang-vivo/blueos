@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::{
+    memory_info_from_frames,
     source::{FirstFitSource, PageSource, PendingPages},
     PageHeap,
 };
@@ -29,6 +30,7 @@ use core::{
 struct CountingSource {
     inner: FirstFitSource,
     fail_next: AtomicBool,
+    free_run_override: AtomicUsize,
     live_pages: AtomicUsize,
     probe: SpinLock<Option<Weak<PageHeap<CountingSource>>>>,
 }
@@ -37,6 +39,7 @@ impl CountingSource {
         Self {
             inner: FirstFitSource,
             fail_next: AtomicBool::new(false),
+            free_run_override: AtomicUsize::new(usize::MAX),
             live_pages: AtomicUsize::new(0),
             probe: SpinLock::new(None),
         }
@@ -71,10 +74,17 @@ unsafe impl PageSource for CountingSource {
         self.live_pages.fetch_sub(span.pages(), Ordering::AcqRel);
     }
     fn frame_stats(&self) -> FrameStats {
+        self.assert_unlocked();
         self.inner.frame_stats()
     }
     fn largest_free_run_bytes(&self) -> usize {
-        self.inner.largest_free_run_bytes()
+        self.assert_unlocked();
+        let value = self.free_run_override.load(Ordering::Acquire);
+        if value == usize::MAX {
+            self.inner.largest_free_run_bytes()
+        } else {
+            value
+        }
     }
 }
 
@@ -299,4 +309,43 @@ fn realloc_shrinks_slab_and_accepts_new_layout() {
             .dealloc(resized.as_ptr(), Layout::from_size_align(12, 8).unwrap());
     }
     assert_eq!(f.heap.source.live_pages.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn frame_summary_excludes_reservations_from_allocatable_total() {
+    let info = memory_info_from_frames(FrameStats {
+        total: 100,
+        reserved: 10,
+        allocated: 20,
+        free: 70,
+        peak_allocated: 30,
+    });
+    assert_eq!(info.total, 90 * PAGE_SIZE);
+    assert_eq!(info.used, 20 * PAGE_SIZE);
+    assert_eq!(info.max_used, 30 * PAGE_SIZE);
+}
+
+#[test]
+fn memory_queries_read_source_outside_heap_lock_and_keep_slab_capacity() {
+    let f = KernelFixture::new();
+    let layout = Layout::from_size_align(24, 8).unwrap();
+    let ptr = f.heap.alloc(layout).unwrap();
+    let stats = f.heap.source.frame_stats();
+    let info = f.heap.memory_info();
+    assert_eq!(info.total, (stats.total - stats.reserved) * PAGE_SIZE);
+    // Other kernel allocations can change physical usage between snapshots.
+    assert!(info.used >= PAGE_SIZE);
+    f.heap
+        .source
+        .free_run_override
+        .store(8192, Ordering::Release);
+    assert_eq!(f.heap.get_max_free_block_size(), 8192);
+    f.heap.source.free_run_override.store(0, Ordering::Release);
+    assert_eq!(f.heap.get_max_free_block_size(), 32);
+    let second = f.heap.alloc(layout).unwrap();
+    unsafe {
+        f.heap.dealloc(ptr.as_ptr(), layout);
+        f.heap.dealloc(second.as_ptr(), layout);
+    }
+    assert_eq!(f.heap.get_max_free_block_size(), 0);
 }
