@@ -386,3 +386,91 @@ fn slab_rejects_two_page_candidates_without_consuming_them() {
     f.release(span);
     assert_eq!(f.free_pages(), 4);
 }
+
+#[test]
+fn reuse_preserves_capacity_and_rejects_invalid_requests() {
+    let mut f = Fixture::new(8);
+    let span = f.take(4, PAGE_SIZE).unwrap();
+    let old = Layout::from_size_align(9000, 64).unwrap();
+    let a = unsafe { f.heap.commit_large(span, old) }.unwrap();
+    let stats = f.heap.stats();
+    let small = Layout::from_size_align(1000, 64).unwrap();
+    assert_eq!(
+        unsafe { f.heap.try_reuse(a.ptr, Some(old), small) },
+        Ok(true)
+    );
+    let info = f.heap.allocation_info(a.ptr).unwrap();
+    assert_eq!(info.requested_size, Some(1000));
+    assert_eq!(info.span.pages(), 4);
+    assert_eq!(f.heap.stats(), stats);
+    assert_eq!(
+        unsafe { f.heap.try_reuse(a.ptr, Some(old), small) },
+        Err(HeapError::LayoutMismatch)
+    );
+    assert_eq!(
+        unsafe {
+            f.heap.try_reuse(
+                a.ptr,
+                Some(small),
+                Layout::from_size_align(20000, 64).unwrap(),
+            )
+        },
+        Ok(false)
+    );
+    assert_eq!(
+        f.heap.allocation_info(a.ptr).unwrap().requested_size,
+        Some(1000)
+    );
+    match unsafe { f.heap.free(a.ptr, Some(small)) }.unwrap() {
+        ReleaseAction::Pages(span) => f.release(span),
+        ReleaseAction::None => panic!(),
+    }
+    assert_eq!(f.free_pages(), 8);
+}
+
+#[test]
+fn slab_reuse_and_invalid_free_leave_allocation_unchanged() {
+    let mut f = Fixture::new(4);
+    let old = Layout::from_size_align(33, 16).unwrap();
+    let AllocationPlan::Slab(class) = classify(old).unwrap() else {
+        panic!()
+    };
+    let span = f.take(1, PAGE_SIZE).unwrap();
+    unsafe {
+        PageHeap::format_slab(span, class).unwrap();
+    }
+    let SlabCommit::Inserted(a) = (unsafe { f.heap.commit_slab(span, class) }).unwrap() else {
+        panic!()
+    };
+    let stats = f.heap.stats();
+    assert_eq!(
+        unsafe {
+            f.heap
+                .try_reuse(a.ptr, Some(old), Layout::from_size_align(60, 32).unwrap())
+        },
+        Ok(true)
+    );
+    assert_eq!(
+        unsafe {
+            f.heap
+                .try_reuse(a.ptr, Some(old), Layout::from_size_align(65, 16).unwrap())
+        },
+        Ok(false)
+    );
+    assert_eq!(
+        unsafe {
+            f.heap
+                .free(a.ptr, Some(Layout::from_size_align(65, 16).unwrap()))
+        },
+        Err(HeapError::LayoutMismatch)
+    );
+    assert!(unsafe { f.heap.free(span.start(), None) }.is_err());
+    let interior = unsafe { std::ptr::NonNull::new_unchecked(a.ptr.as_ptr().add(1)) };
+    assert!(unsafe { f.heap.free(interior, None) }.is_err());
+    assert_eq!(f.heap.stats(), stats);
+    assert_eq!(f.heap.allocation_info(a.ptr).unwrap().capacity, 64);
+    match unsafe { f.heap.free(a.ptr, Some(old)) }.unwrap() {
+        ReleaseAction::Pages(span) => f.release(span),
+        ReleaseAction::None => panic!(),
+    }
+}

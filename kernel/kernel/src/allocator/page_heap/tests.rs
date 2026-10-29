@@ -206,3 +206,97 @@ fn private_heap_uses_existing_slots_without_requesting_pages() {
     }
     assert_eq!(f.heap.heap_stats().backing_bytes, 0);
 }
+
+#[test]
+fn c_requests_and_failed_realloc_preserve_old_allocation() {
+    let f = KernelFixture::new();
+    assert!(f.heap.malloc(0).is_null());
+    assert!(f.heap.malloc_align(17, 3).is_null());
+    assert!(f.heap.calloc(usize::MAX, 2).is_null());
+    let old = f.heap.malloc_align(63, 64);
+    assert!(!old.is_null());
+    unsafe {
+        old.write_bytes(0x5a, 63);
+    }
+    f.heap.source.fail_next.store(true, Ordering::Release);
+    let result = unsafe { f.heap.c_realloc(old, 8193) };
+    assert!(result.is_null());
+    for i in 0..63 {
+        assert_eq!(unsafe { old.add(i).read() }, 0x5a);
+    }
+    assert_eq!(f.heap.heap_stats().live_objects, 1);
+    let zeroed = f.heap.calloc(17, 19);
+    assert!(!zeroed.is_null());
+    for i in 0..17 * 19 {
+        assert_eq!(unsafe { zeroed.add(i).read() }, 0);
+    }
+    unsafe {
+        f.heap.free(old);
+        f.heap.free(zeroed);
+    }
+    assert_eq!(f.heap.source.live_pages.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn realloc_moves_preserving_data_and_alignment() {
+    let f = KernelFixture::new();
+    let layout = Layout::from_size_align(63, 64).unwrap();
+    let old = f.heap.alloc(layout).unwrap();
+    unsafe {
+        old.as_ptr().write_bytes(0x37, 63);
+    }
+    let new = unsafe { f.heap.realloc(old.as_ptr(), layout, 8193) }.unwrap();
+    assert_eq!(new.as_ptr().addr() % 64, 0);
+    for i in 0..63 {
+        assert_eq!(unsafe { new.as_ptr().add(i).read() }, 0x37);
+    }
+    assert!(f.heap.size_of_allocation(new) >= 8193);
+    unsafe {
+        f.heap
+            .dealloc(new.as_ptr(), Layout::from_size_align(8193, 64).unwrap());
+    }
+}
+
+#[test]
+fn c_realloc_null_zero_and_large_alignment() {
+    let f = KernelFixture::new();
+    let p = unsafe { f.heap.c_realloc(core::ptr::null_mut(), 37) };
+    assert!(!p.is_null());
+    assert!(unsafe { f.heap.c_realloc(p, 0) }.is_null());
+    let p = f.heap.malloc_align(8193, 65536);
+    assert!(!p.is_null());
+    unsafe {
+        p.write_bytes(0x4c, 8193);
+    }
+    let q = unsafe { f.heap.c_realloc(p, 20000) };
+    assert!(!q.is_null());
+    assert_eq!(q.addr() % 65536, 0);
+    for i in 0..8193 {
+        assert_eq!(unsafe { q.add(i).read() }, 0x4c);
+    }
+    unsafe {
+        f.heap.free_align(q, 65536);
+        f.heap.free(core::ptr::null_mut());
+    }
+}
+
+// A smaller slab layout must remain valid for a later Rust deallocation.
+#[test]
+fn realloc_shrinks_slab_and_accepts_new_layout() {
+    let f = KernelFixture::new();
+    let old = Layout::from_size_align(63, 8).unwrap();
+    let ptr = f.heap.alloc(old).unwrap();
+    unsafe {
+        ptr.as_ptr().write_bytes(0x27, 12);
+    }
+    let resized = unsafe { f.heap.realloc(ptr.as_ptr(), old, 12) }.unwrap();
+    assert_eq!(resized, ptr);
+    for i in 0..12 {
+        assert_eq!(unsafe { resized.as_ptr().add(i).read() }, 0x27);
+    }
+    unsafe {
+        f.heap
+            .dealloc(resized.as_ptr(), Layout::from_size_align(12, 8).unwrap());
+    }
+    assert_eq!(f.heap.source.live_pages.load(Ordering::Acquire), 0);
+}

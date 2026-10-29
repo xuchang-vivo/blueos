@@ -374,6 +374,53 @@ impl<'a> PageHeap<'a> {
         })
     }
 
+    /// Attempts to retain an allocation without changing its backing pages.
+    ///
+    /// # Safety
+    /// `ptr` must retain its provenance and the caller must exclusively own
+    /// the allocation for the duration of the resize.
+    pub unsafe fn try_reuse(
+        &mut self,
+        ptr: NonNull<u8>,
+        old: Option<Layout>,
+        new: Layout,
+    ) -> Result<bool, HeapError> {
+        let info = self.allocation_info(ptr)?;
+        if let Some(layout) = old {
+            match info.kind {
+                AllocationKind::Slab(class) => {
+                    if layout.size() == 0
+                        || layout.size() > class.size()
+                        || layout.align() > class.size()
+                    {
+                        return Err(HeapError::LayoutMismatch);
+                    }
+                }
+                AllocationKind::Large => {
+                    if Some(layout.size()) != info.requested_size || layout.align() != info.align {
+                        return Err(HeapError::LayoutMismatch);
+                    }
+                }
+            }
+        }
+        if new.size() == 0 {
+            return Err(HeapError::InvalidRequest);
+        }
+        if new.size() > info.capacity || ptr.as_ptr().addr() & (new.align() - 1) != 0 {
+            return Ok(false);
+        }
+        if let AllocationKind::Slab(class) = info.kind {
+            if new.align() > class.size() {
+                return Ok(false);
+            }
+        } else {
+            let head = PageOwner::large_head(info.span.pages(), new)?;
+            let first = self.window.index_of(info.span.start())?;
+            self.owners[first] = head;
+        }
+        Ok(true)
+    }
+
     /// Validates and detaches a large run. The caller returns detached pages to
     /// their source after releasing any heap lock.
     ///
@@ -388,7 +435,10 @@ impl<'a> PageHeap<'a> {
         let info = self.allocation_info(ptr)?;
         if let AllocationKind::Slab(class) = info.kind {
             if let Some(layout) = layout {
-                if classify(layout) != Ok(AllocationPlan::Slab(class)) {
+                if layout.size() == 0
+                    || layout.size() > class.size()
+                    || layout.align() > class.size()
+                {
                     return Err(HeapError::LayoutMismatch);
                 }
             }
