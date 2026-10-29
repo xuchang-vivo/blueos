@@ -27,6 +27,9 @@ use core::{alloc::GlobalAlloc, ptr};
 // Raw heap implementations are in the allocator_crate.
 // This module only contains SpinLock wrappers and the GlobalAlloc impl.
 
+#[cfg(paging)]
+mod page_heap;
+
 #[cfg(allocator_buddy)]
 mod buddy;
 #[cfg(any(allocator = "tlsf", allocator = "slab", allocator = "slab_dynamic"))]
