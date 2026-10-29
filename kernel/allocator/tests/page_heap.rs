@@ -464,6 +464,27 @@ fn slab_reuse_and_invalid_free_leave_allocation_unchanged() {
         },
         Err(HeapError::LayoutMismatch)
     );
+    // The first slot is 128-byte aligned even though its class guarantees only 64.
+    // This exercises the slab-specific over-alignment check, not the address check.
+    assert_eq!(a.ptr.as_ptr().addr() % 128, 0);
+    let over_aligned = Layout::from_size_align(33, 128).unwrap();
+    assert_eq!(
+        unsafe { f.heap.try_reuse(a.ptr, Some(over_aligned), old) },
+        Err(HeapError::LayoutMismatch)
+    );
+    assert_eq!(
+        unsafe { f.heap.free(a.ptr, Some(over_aligned)) },
+        Err(HeapError::LayoutMismatch)
+    );
+    assert_eq!(
+        unsafe { f.heap.try_reuse(a.ptr, Some(old), over_aligned) },
+        Ok(false)
+    );
+    assert_eq!(f.heap.stats(), stats);
+    let info = f.heap.allocation_info(a.ptr).unwrap();
+    assert_eq!(info.kind, AllocationKind::Slab(class));
+    assert_eq!(info.capacity, 64);
+    assert_eq!(info.span, span);
     assert!(unsafe { f.heap.free(span.start(), None) }.is_err());
     let interior = unsafe { std::ptr::NonNull::new_unchecked(a.ptr.as_ptr().add(1)) };
     assert!(unsafe { f.heap.free(interior, None) }.is_err());
@@ -473,4 +494,5 @@ fn slab_reuse_and_invalid_free_leave_allocation_unchanged() {
         ReleaseAction::Pages(span) => f.release(span),
         ReleaseAction::None => panic!(),
     }
+    assert_eq!(f.free_pages(), 4);
 }

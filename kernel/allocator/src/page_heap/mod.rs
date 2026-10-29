@@ -386,23 +386,7 @@ impl<'a> PageHeap<'a> {
         new: Layout,
     ) -> Result<bool, HeapError> {
         let info = self.allocation_info(ptr)?;
-        if let Some(layout) = old {
-            match info.kind {
-                AllocationKind::Slab(class) => {
-                    if layout.size() == 0
-                        || layout.size() > class.size()
-                        || layout.align() > class.size()
-                    {
-                        return Err(HeapError::LayoutMismatch);
-                    }
-                }
-                AllocationKind::Large => {
-                    if Some(layout.size()) != info.requested_size || layout.align() != info.align {
-                        return Err(HeapError::LayoutMismatch);
-                    }
-                }
-            }
-        }
+        validate_original_layout(info, old)?;
         if new.size() == 0 {
             return Err(HeapError::InvalidRequest);
         }
@@ -433,21 +417,9 @@ impl<'a> PageHeap<'a> {
         layout: Option<Layout>,
     ) -> Result<ReleaseAction, HeapError> {
         let info = self.allocation_info(ptr)?;
-        if let AllocationKind::Slab(class) = info.kind {
-            if let Some(layout) = layout {
-                if layout.size() == 0
-                    || layout.size() > class.size()
-                    || layout.align() > class.size()
-                {
-                    return Err(HeapError::LayoutMismatch);
-                }
-            }
+        validate_original_layout(info, layout)?;
+        if let AllocationKind::Slab(_) = info.kind {
             return self.free_slab(ptr, info);
-        }
-        if let Some(layout) = layout {
-            if Some(layout.size()) != info.requested_size || layout.align() != info.align {
-                return Err(HeapError::LayoutMismatch);
-            }
         }
         let first = self.window.index_of(info.span.start)?;
         let mut stats = self.stats;
@@ -470,5 +442,25 @@ impl<'a> PageHeap<'a> {
         self.owners[first..first + info.span.pages].fill(PageOwner::EMPTY);
         self.stats = stats;
         Ok(ReleaseAction::Pages(info.span))
+    }
+}
+
+// Slabs retain their class, not each object's original requested layout.
+fn validate_original_layout(info: AllocationInfo, layout: Option<Layout>) -> Result<(), HeapError> {
+    let Some(layout) = layout else {
+        return Ok(());
+    };
+    let valid = match info.kind {
+        AllocationKind::Slab(class) => {
+            layout.size() != 0 && layout.size() <= class.size() && layout.align() <= class.size()
+        }
+        AllocationKind::Large => {
+            Some(layout.size()) == info.requested_size && layout.align() == info.align
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(HeapError::LayoutMismatch)
     }
 }
