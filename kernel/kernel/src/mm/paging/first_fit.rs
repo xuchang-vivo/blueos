@@ -19,7 +19,7 @@
 //! `alloc_zeroed_frame` before exposing a page to users. Guards return frames
 //! on drop; `into_raw` transfers ownership to a mapping's lifecycle manager.
 
-use super::{FrameAllocator, FrameDeallocationError, FrameUsage};
+use super::{FrameAllocator, FrameDeallocationError, FrameStats, FrameUsage};
 use crate::{
     mm::{kernel_phys_to_virt, memory_bank::MemoryRegion, PhysicalAddress},
     sync::SpinLock,
@@ -85,7 +85,10 @@ struct AllocatorState {
     states: &'static mut [FrameState],
     // No free frame exists below this index. Freeing updates the cursor.
     first_free: usize,
+    reserved: usize,
+    allocated: usize,
     free: usize,
+    peak_allocated: usize,
 }
 
 /// The system's shared allocator is accessed through [`Self::instance`].
@@ -144,12 +147,20 @@ impl FirstFitFrameAllocator {
             .iter()
             .position(|state| *state == FrameState::Free)
             .unwrap_or(states.len());
+        let reserved = states
+            .iter()
+            .filter(|state| **state == FrameState::Reserved)
+            .count();
+        let allocated = states.len() - reserved - free;
         *state = Some(AllocatorState {
             base,
             page_size,
             states,
             first_free,
+            reserved,
+            allocated,
             free,
+            peak_allocated: allocated,
         });
         Some(())
     }
@@ -163,6 +174,36 @@ impl FirstFitFrameAllocator {
         ))
     }
 
+    /// Snapshot the physical frame counts under the allocator lock.
+    pub fn frame_stats(&self) -> Option<FrameStats> {
+        let state = self.state.irqsave_lock();
+        let state = state.as_ref()?;
+        Some(FrameStats {
+            total: state.states.len(),
+            reserved: state.reserved,
+            allocated: state.allocated,
+            free: state.free,
+            peak_allocated: state.peak_allocated,
+        })
+    }
+
+    /// Return the longest contiguous free run, in pages.
+    pub fn largest_free_run(&self) -> Option<usize> {
+        let state = self.state.irqsave_lock();
+        let state = state.as_ref()?;
+        let mut largest = 0;
+        let mut run = 0;
+        for frame in &state.states[state.first_free..] {
+            if *frame == FrameState::Free {
+                run += 1;
+                largest = largest.max(run);
+            } else {
+                run = 0;
+            }
+        }
+        Some(largest)
+    }
+
     /// Allocate one frame without clearing its previous contents.
     pub fn alloc_frame(&self) -> Option<PhysicalAddress> {
         self.alloc_frames(1)
@@ -171,27 +212,49 @@ impl FirstFitFrameAllocator {
     /// Allocate a contiguous run atomically, leaving state unchanged on failure.
     /// The returned pages are owned by the caller until `free_frames`.
     pub fn alloc_frames(&self, count: usize) -> Option<PhysicalAddress> {
+        self.alloc_frames_aligned(count, 1)
+    }
+
+    /// Allocate contiguous pages aligned to an absolute physical address.
+    /// `align_pages` must be a nonzero power of two. Invalid requests and
+    /// searches without a suitable run leave all allocator state unchanged.
+    pub fn alloc_frames_aligned(
+        &self,
+        count: usize,
+        align_pages: usize,
+    ) -> Option<PhysicalAddress> {
         let mut state = self.state.irqsave_lock();
         let state = state.as_mut()?;
-        if count == 0 || count > state.free {
+        if count == 0 || count > state.free || !align_pages.is_power_of_two() {
             return None;
         }
+        count.checked_mul(state.page_size)?;
+        let align_bytes = align_pages.checked_mul(state.page_size)?;
         let mut run = 0;
-        let mut first = None;
+        let mut found = None;
         for index in state.first_free..state.states.len() {
             if state.states[index] == FrameState::Free {
                 run += 1;
-                if run == count {
-                    first = Some(index + 1 - count);
+                if run >= count {
+                    let first = index + 1 - count;
+                    let start_addr = state
+                        .base
+                        .checked_add(first.checked_mul(state.page_size)?)?;
+                    if start_addr & (align_bytes - 1) != 0 {
+                        continue;
+                    }
+                    found = Some((first, start_addr));
                     break;
                 }
             } else {
                 run = 0;
             }
         }
-        let first = first?;
+        let (first, start_addr) = found?;
         state.states[first..first + count].fill(FrameState::Allocated);
+        state.allocated += count;
         state.free -= count;
+        state.peak_allocated = state.peak_allocated.max(state.allocated);
         // A fragmented run may have been skipped; preserve its free pages.
         if first == state.first_free {
             let end = first + count;
@@ -200,7 +263,7 @@ impl FirstFitFrameAllocator {
                 .position(|frame| *frame == FrameState::Free)
                 .map_or(state.states.len(), |offset| end + offset);
         }
-        Some(PhysicalAddress::new(state.base + first * state.page_size))
+        Some(PhysicalAddress::new(start_addr))
     }
 
     /// # Safety
@@ -245,6 +308,7 @@ impl FirstFitFrameAllocator {
             }
         }
         state.states[first..end].fill(FrameState::Free);
+        state.allocated -= count;
         state.free += count;
         state.first_free = state.first_free.min(first);
         Ok(())
@@ -252,9 +316,18 @@ impl FirstFitFrameAllocator {
 
     /// Allocate an owned run which is automatically released on failure paths.
     pub fn alloc_owned_frames(&self, count: usize) -> Option<FrameAllocation<'_>> {
+        self.alloc_owned_frames_aligned(count, 1)
+    }
+
+    /// Allocate an aligned run with automatic rollback until ownership transfer.
+    pub fn alloc_owned_frames_aligned(
+        &self,
+        count: usize,
+        align_pages: usize,
+    ) -> Option<FrameAllocation<'_>> {
         Some(FrameAllocation {
             allocator: self,
-            start: self.alloc_frames(count)?,
+            start: self.alloc_frames_aligned(count, align_pages)?,
             count,
         })
     }

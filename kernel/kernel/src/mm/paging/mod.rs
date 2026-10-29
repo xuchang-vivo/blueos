@@ -135,6 +135,16 @@ pub struct FrameUsage {
     total: usize,
 }
 
+/// Physical page counts, with reserved pages excluded from allocation peaks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrameStats {
+    pub total: usize,
+    pub reserved: usize,
+    pub allocated: usize,
+    pub free: usize,
+    pub peak_allocated: usize,
+}
+
 impl FrameUsage {
     pub fn new(used: usize, total: usize) -> Self {
         FrameUsage { used, total }

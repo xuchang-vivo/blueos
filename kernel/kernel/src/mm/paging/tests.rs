@@ -15,7 +15,7 @@
 use super::{
     first_fit::{init_frame_states, FirstFitFrameAllocator, FrameState},
     mapper::PageMapper,
-    FrameDeallocationError, PageFormat,
+    FrameDeallocationError, FrameStats, PageFormat,
 };
 use crate::mm::{
     kernel_phys_to_virt, kernel_virt_to_phys, memory_bank::MemoryRegion, CachePolicy, MemAttribute,
@@ -38,6 +38,7 @@ struct Fixture<const N: usize> {
     _states: Box<[FrameState; N]>,
     backing: NonNull<u8>,
     layout: Layout,
+    managed_base: PhysicalAddress,
 }
 
 impl<const N: usize> Fixture<N> {
@@ -64,11 +65,40 @@ impl<const N: usize> Fixture<N> {
             _states: states,
             backing,
             layout,
+            managed_base: base,
+        }
+    }
+
+    fn with_misaligned_base(states: [FrameState; N]) -> Self {
+        let layout = Layout::from_size_align((N + 1) * PAGE_SIZE, PAGE_SIZE).unwrap();
+        let backing = NonNull::new(unsafe { alloc(layout) }).unwrap();
+        let physical = kernel_virt_to_phys(VirtualAddress::new(backing.as_ptr() as usize));
+        let skip = usize::from((physical.into_raw() & (4 * PAGE_SIZE - 1)) == 0);
+        let managed_base = PhysicalAddress::new(physical.into_raw() + skip * PAGE_SIZE);
+        let mut states = Box::new(states);
+        let allocator = FirstFitFrameAllocator::new();
+        // SAFETY: the N-page managed window lies inside this fixture's N+1
+        // backing pages, with the same lifetime guarantees as `new`.
+        unsafe {
+            allocator
+                .init(
+                    managed_base,
+                    PAGE_SIZE,
+                    &mut *(&mut *states as *mut [FrameState; N]),
+                )
+                .unwrap();
+        }
+        Self {
+            allocator,
+            _states: states,
+            backing,
+            layout,
+            managed_base,
         }
     }
 
     fn base(&self) -> PhysicalAddress {
-        kernel_virt_to_phys(VirtualAddress::new(self.backing.as_ptr() as usize))
+        self.managed_base
     }
 
     fn frame(&self, index: usize) -> PhysicalAddress {
@@ -81,6 +111,140 @@ impl<const N: usize> Drop for Fixture<N> {
         // All guards borrow this fixture and have already been dropped.
         unsafe { dealloc(self.backing.as_ptr(), self.layout) };
     }
+}
+
+#[test]
+fn aligned_runs_use_absolute_physical_alignment() {
+    let fixture = Fixture::with_misaligned_base([FrameState::Free; 8]);
+    let allocator = &fixture.allocator;
+    assert_ne!(fixture.base().into_raw() % (4 * PAGE_SIZE), 0);
+    let run = allocator.alloc_owned_frames_aligned(2, 4).unwrap();
+    assert_eq!(run.address().into_raw() % (4 * PAGE_SIZE), 0);
+    let stats = allocator.frame_stats().unwrap();
+    assert_eq!(
+        (stats.allocated, stats.free, stats.peak_allocated),
+        (2, 6, 2)
+    );
+    drop(run);
+    let after = allocator.frame_stats().unwrap();
+    assert_eq!(
+        (after.allocated, after.free, after.peak_allocated),
+        (0, 8, 2)
+    );
+}
+
+#[test]
+fn aligned_search_preserves_skipped_frames_on_success_and_failure() {
+    let fixture = Fixture::with_misaligned_base([FrameState::Free; 8]);
+    let allocator = &fixture.allocator;
+    let before = allocator.frame_stats().unwrap();
+    assert!(allocator.alloc_frames_aligned(8, 4).is_none());
+    assert_eq!(allocator.frame_stats().unwrap(), before);
+    let run = allocator.alloc_owned_frames_aligned(2, 4).unwrap();
+    let first = allocator.alloc_owned_frames(1).unwrap();
+    assert_eq!(first.address(), fixture.base());
+    drop(first);
+    drop(run);
+    assert_eq!(allocator.frame_stats().unwrap().free, 8);
+}
+
+#[test]
+fn invalid_alignment_does_not_consume_frames() {
+    let fixture = Fixture::new([FrameState::Free; 8]);
+    let allocator = &fixture.allocator;
+    let before = allocator.frame_stats().unwrap();
+    assert!(allocator.alloc_frames_aligned(1, 0).is_none());
+    assert!(allocator.alloc_frames_aligned(1, 3).is_none());
+    assert!(allocator.alloc_frames_aligned(usize::MAX, 1).is_none());
+    assert!(allocator.alloc_frames_aligned(0, 1).is_none());
+    assert!(allocator
+        .alloc_frames_aligned(1, 1usize << (usize::BITS - 1))
+        .is_none());
+    assert_eq!(allocator.frame_stats().unwrap(), before);
+    assert_eq!(
+        allocator.alloc_owned_frames(1).unwrap().address(),
+        fixture.base()
+    );
+}
+
+#[test]
+fn reserved_holes_bound_free_runs_and_preserve_statistics() {
+    use FrameState::{Free as F, Reserved as R};
+    let fixture = Fixture::new([F, R, F, F, R, F]);
+    let allocator = &fixture.allocator;
+    let initial = FrameStats {
+        total: 6,
+        reserved: 2,
+        allocated: 0,
+        free: 4,
+        peak_allocated: 0,
+    };
+    assert_eq!(allocator.frame_stats().unwrap(), initial);
+    assert_eq!(allocator.usage().unwrap().used(), 2);
+    assert_eq!(allocator.largest_free_run(), Some(2));
+    assert!(allocator.alloc_frames_aligned(3, 1).is_none());
+    assert_eq!(allocator.frame_stats().unwrap(), initial);
+    let run = allocator.alloc_owned_frames_aligned(2, 1).unwrap();
+    assert_eq!(run.address(), fixture.frame(2));
+    assert_eq!(allocator.largest_free_run(), Some(1));
+    assert_eq!(allocator.usage().unwrap().used(), 4);
+    let allocated = FrameStats {
+        allocated: 2,
+        free: 2,
+        peak_allocated: 2,
+        ..initial
+    };
+    assert_eq!(allocator.frame_stats().unwrap(), allocated);
+    assert_eq!(
+        unsafe { allocator.free_frames(run.address(), 3) },
+        Err(FrameDeallocationError::Reserved)
+    );
+    assert_eq!(allocator.frame_stats().unwrap(), allocated);
+    let first = allocator.alloc_owned_frames(1).unwrap();
+    assert_eq!(first.address(), fixture.base());
+    drop(first);
+    drop(run);
+    assert_eq!(allocator.largest_free_run(), Some(2));
+    assert_eq!(
+        allocator.frame_stats().unwrap(),
+        FrameStats {
+            peak_allocated: 3,
+            ..initial
+        }
+    );
+}
+
+#[test]
+fn frame_statistics_track_initial_allocations_and_empty_free_runs() {
+    let fresh = FirstFitFrameAllocator::new();
+    assert_eq!(fresh.frame_stats(), None);
+    assert_eq!(fresh.largest_free_run(), None);
+    use FrameState::{Allocated as A, Reserved as R};
+    let fixture = Fixture::new([R, A]);
+    let allocator = &fixture.allocator;
+    assert_eq!(
+        allocator.frame_stats(),
+        Some(FrameStats {
+            total: 2,
+            reserved: 1,
+            allocated: 1,
+            free: 0,
+            peak_allocated: 1,
+        })
+    );
+    assert_eq!(allocator.largest_free_run(), Some(0));
+    unsafe { allocator.free_frame(fixture.frame(1)).unwrap() };
+    assert_eq!(
+        allocator.frame_stats(),
+        Some(FrameStats {
+            total: 2,
+            reserved: 1,
+            allocated: 0,
+            free: 1,
+            peak_allocated: 1,
+        })
+    );
+    assert_eq!(allocator.largest_free_run(), Some(1));
 }
 
 #[test]
