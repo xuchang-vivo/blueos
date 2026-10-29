@@ -17,6 +17,7 @@ use core::alloc::Layout;
 
 // Low two bits are tags. Heads reserve six more bits for log2(alignment).
 const TAG_MASK: usize = 0b11;
+const SLAB: usize = 0b01;
 const LARGE_HEAD: usize = 0b10;
 const LARGE_TAIL: usize = 0b11;
 const ALIGN_BITS: u32 = 6;
@@ -40,6 +41,23 @@ impl PageOwner {
     }
     pub(super) fn can_encode_index(index: usize) -> bool {
         index <= usize::MAX >> 2
+    }
+
+    pub(super) fn slab(class: super::ClassId) -> Self {
+        Self {
+            words: [((class.0 as usize) << 2) | SLAB, 0],
+        }
+    }
+
+    pub(super) fn slab_class(self) -> Result<Option<super::ClassId>, HeapError> {
+        if self.words[0] & TAG_MASK != SLAB {
+            return Ok(None);
+        }
+        let index = self.words[0] >> 2;
+        if self.words[1] != 0 || index >= super::CLASS_SIZES.len() {
+            return Err(HeapError::CorruptMetadata);
+        }
+        Ok(Some(super::ClassId(index as u8)))
     }
 
     pub(super) fn large_head(pages: usize, layout: Layout) -> Result<Self, HeapError> {

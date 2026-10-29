@@ -241,3 +241,148 @@ fn invalid_large_commits_and_layouts_preserve_existing_allocation() {
     }
     assert_eq!(f.free_pages(), 8);
 }
+
+#[test]
+fn slab_rechecks_existing_capacity_and_returns_last_page() {
+    let mut f = Fixture::new(8);
+    let class = match classify(Layout::from_size_align(33, 16).unwrap()).unwrap() {
+        AllocationPlan::Slab(class) => class,
+        AllocationPlan::Pages(_) => panic!("64-byte class required"),
+    };
+    let first = f.take(1, PAGE_SIZE).unwrap();
+    let extra = f.take(1, PAGE_SIZE).unwrap();
+    unsafe {
+        PageHeap::format_slab(first, class).unwrap();
+    }
+    unsafe {
+        PageHeap::format_slab(extra, class).unwrap();
+    }
+    let a = match unsafe { f.heap.commit_slab(first, class) }.unwrap() {
+        SlabCommit::Inserted(a) => a,
+        SlabCommit::Existing(_) => panic!("first page must be inserted"),
+    };
+    let b = match unsafe { f.heap.commit_slab(extra, class) }.unwrap() {
+        SlabCommit::Existing(b) => b,
+        SlabCommit::Inserted(_) => panic!("existing page has capacity"),
+    };
+    f.release(extra);
+    assert_ne!(a.ptr, b.ptr);
+    assert_eq!(f.heap.stats().slab_pages, 1);
+    assert_eq!(
+        unsafe { f.heap.free(a.ptr, None) }.unwrap(),
+        ReleaseAction::None
+    );
+    assert_eq!(
+        unsafe { f.heap.free(a.ptr, None) },
+        Err(HeapError::NotAllocated)
+    );
+    match unsafe { f.heap.free(b.ptr, None) }.unwrap() {
+        ReleaseAction::Pages(span) => f.release(span),
+        ReleaseAction::None => panic!("last object must detach its page"),
+    }
+    assert_eq!(f.free_pages(), 8);
+    assert_eq!(f.heap.stats().live_objects, 0);
+}
+
+#[test]
+fn all_slab_classes_preserve_payloads_and_reclaim_full_pages() {
+    for size in CLASS_SIZES {
+        let mut f = Fixture::new(4);
+        let layout = Layout::from_size_align(size, size).unwrap();
+        let AllocationPlan::Slab(class) = classify(layout).unwrap() else {
+            unreachable!()
+        };
+        let first = f.take(1, PAGE_SIZE).unwrap();
+        unsafe {
+            PageHeap::format_slab(first, class).unwrap();
+        }
+        let SlabCommit::Inserted(a) = (unsafe { f.heap.commit_slab(first, class) }).unwrap() else {
+            panic!()
+        };
+        let mut objects = vec![a];
+        while let Some(a) = f.heap.try_alloc_small(class).unwrap() {
+            objects.push(a);
+        }
+        assert_eq!(f.heap.largest_free_slot(), 0);
+        let first_count = objects.len();
+        let second = f.take(1, PAGE_SIZE).unwrap();
+        unsafe {
+            PageHeap::format_slab(second, class).unwrap();
+        }
+        let SlabCommit::Inserted(a) = (unsafe { f.heap.commit_slab(second, class) }).unwrap()
+        else {
+            panic!()
+        };
+        objects.push(a);
+        for (i, object) in objects.iter().enumerate() {
+            assert_eq!(object.ptr.as_ptr().addr() % size, 0);
+            assert!(
+                object.ptr.as_ptr().addr()
+                    >= if i < first_count {
+                        first.start().as_ptr().addr()
+                    } else {
+                        second.start().as_ptr().addr()
+                    } + size
+            );
+            unsafe {
+                std::ptr::write_bytes(object.ptr.as_ptr(), (i % 251) as u8, size);
+            }
+        }
+        let mut addresses: Vec<_> = objects
+            .iter()
+            .map(|object| object.ptr.as_ptr().addr())
+            .collect();
+        addresses.sort_unstable();
+        assert!(addresses.windows(2).all(|pair| pair[1] - pair[0] >= size));
+        for (i, object) in objects.iter().enumerate() {
+            for j in 0..size {
+                assert_eq!(unsafe { *object.ptr.as_ptr().add(j) }, (i % 251) as u8);
+            }
+            let info = f.heap.allocation_info(object.ptr).unwrap();
+            assert_eq!(info.kind, AllocationKind::Slab(class));
+            assert_eq!(info.capacity, size);
+        }
+        let first_object = objects[0];
+        assert_eq!(
+            unsafe { f.heap.free(first_object.ptr, Some(layout)) }.unwrap(),
+            ReleaseAction::None
+        );
+        assert_eq!(f.heap.largest_free_slot(), size);
+        let reused = f.heap.try_alloc_small(class).unwrap().unwrap();
+        assert_eq!(reused.ptr, first_object.ptr);
+        for object in objects
+            .iter()
+            .step_by(2)
+            .chain(objects.iter().skip(1).step_by(2))
+        {
+            if let ReleaseAction::Pages(span) =
+                unsafe { f.heap.free(object.ptr, Some(layout)) }.unwrap()
+            {
+                f.release(span);
+            }
+        }
+        assert_eq!(f.free_pages(), 4);
+        assert_eq!(f.heap.stats().slab_pages, 0);
+        assert_eq!(f.heap.stats().charged_bytes, 0);
+    }
+}
+
+#[test]
+fn slab_rejects_two_page_candidates_without_consuming_them() {
+    let mut f = Fixture::new(4);
+    let AllocationPlan::Slab(class) = classify(Layout::from_size_align(8, 8).unwrap()).unwrap()
+    else {
+        unreachable!()
+    };
+    let span = f.take(2, PAGE_SIZE).unwrap();
+    assert_eq!(
+        unsafe { PageHeap::format_slab(span, class) },
+        Err(HeapError::InvalidRequest)
+    );
+    assert_eq!(
+        unsafe { f.heap.commit_slab(span, class) },
+        Err(HeapError::InvalidRequest)
+    );
+    f.release(span);
+    assert_eq!(f.free_pages(), 4);
+}

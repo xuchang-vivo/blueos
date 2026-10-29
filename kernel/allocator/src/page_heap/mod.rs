@@ -18,6 +18,7 @@
 //! module never obtains pages, performs payload initialization, or releases pages.
 
 mod metadata;
+mod slab;
 
 use core::{alloc::Layout, ptr::NonNull};
 pub use metadata::PageOwner;
@@ -228,6 +229,7 @@ pub struct PageHeap<'a> {
     window: PageWindow,
     owners: &'a mut [PageOwner],
     stats: HeapStats,
+    partial: [usize; 8],
 }
 
 impl<'a> PageHeap<'a> {
@@ -250,6 +252,7 @@ impl<'a> PageHeap<'a> {
             window,
             owners,
             stats: HeapStats::default(),
+            partial: [usize::MAX; 8],
         })
     }
 
@@ -259,7 +262,10 @@ impl<'a> PageHeap<'a> {
 
     /// Committed free slab slots; unowned window pages are not heap storage.
     pub fn largest_free_slot(&self) -> usize {
-        0
+        self.partial
+            .iter()
+            .rposition(|index| *index != usize::MAX)
+            .map_or(0, |index| CLASS_SIZES[index])
     }
 
     /// Publishes an exclusively owned run without adding an in-band header.
@@ -326,6 +332,9 @@ impl<'a> PageHeap<'a> {
         if owner.is_empty() {
             return Err(HeapError::NotAllocated);
         }
+        if let Some(class) = owner.slab_class()? {
+            return self.slab_info(index, ptr, class);
+        }
         let first = match owner.tail_index()? {
             Some(first) if first < index => first,
             Some(_) => return Err(HeapError::CorruptMetadata),
@@ -377,6 +386,14 @@ impl<'a> PageHeap<'a> {
         layout: Option<Layout>,
     ) -> Result<ReleaseAction, HeapError> {
         let info = self.allocation_info(ptr)?;
+        if let AllocationKind::Slab(class) = info.kind {
+            if let Some(layout) = layout {
+                if classify(layout) != Ok(AllocationPlan::Slab(class)) {
+                    return Err(HeapError::LayoutMismatch);
+                }
+            }
+            return self.free_slab(ptr, info);
+        }
         if let Some(layout) = layout {
             if Some(layout.size()) != info.requested_size || layout.align() != info.align {
                 return Err(HeapError::LayoutMismatch);
