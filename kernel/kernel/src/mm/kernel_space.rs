@@ -18,17 +18,18 @@ use super::{
     address_space::Vma,
     kernel_phys_to_virt,
     memory_bank::MemoryBank,
-    paging::{first_fit::FirstFitFrameAllocator, mapper::PageMapper, FrameAllocator, PageFormat},
+    paging::{first_fit::FirstFitFrameAllocator, mapper::PageMapper, PageFormat},
     CachePolicy, MemAttribute, MemFlags, MemType, PhysicalAddress,
 };
-use crate::{arch::page::PageEntry, mm::VirtualAddress};
+use crate::arch::page::PageEntry;
 use spin::Once;
 
-// Eight RAM regions, one heap region, and at most one region per board bank.
-const REGION_COUNT: usize = 9 + crate::boards::MEMORY_BANKS.len();
+// Eight RAM segments and at most one device region per board bank.
+const REGION_COUNT: usize = 8 + crate::boards::MEMORY_BANKS.len();
 
 static KERNEL_SPACE: Once<KernelAddressSpace> = Once::new();
 
+#[must_use]
 pub struct KernelAddressSpace {
     regions: [Option<Vma>; REGION_COUNT],
     mapper: PageMapper<&'static FirstFitFrameAllocator, PageEntry>,
@@ -41,6 +42,12 @@ impl KernelAddressSpace {
 
     pub fn root_address(&self) -> PhysicalAddress {
         self.mapper.root_address()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn leaf_descriptor(&self, addr: usize) -> Option<usize> {
+        self.find_region(addr)?;
+        self.mapper.leaf_descriptor(addr)
     }
 
     pub fn find_region(&self, addr: usize) -> Option<Vma> {
@@ -88,7 +95,7 @@ impl KernelAddressSpace {
                 memory_type,
             },
         )?;
-        let mut vma_flags = MemFlags::READ | flags;
+        let vma_flags = MemFlags::READ | flags;
         self.record_region(virt.into_raw(), virt_end, vma_flags)
     }
 
@@ -116,63 +123,6 @@ impl KernelAddressSpace {
         Ok(())
     }
 
-    fn map_heap(&mut self, start: VirtualAddress) -> Result<usize, &'static str> {
-        let mut allocator = FirstFitFrameAllocator::instance();
-        let max_pages = allocator
-            .usage()
-            .ok_or("frame allocator is not initialized")?
-            .free();
-        let max_len = max_pages
-            .checked_mul(PageEntry::PAGE_SIZE)
-            .ok_or("kernel heap size overflow")?;
-        // Allocate table frames first. Every free frame left afterwards belongs
-        // to the heap, so mapping the backing pages must need no further frames.
-        self.mapper.prepare_range(start, max_len)?;
-        let pages = allocator
-            .usage()
-            .ok_or("frame allocator is not initialized")?
-            .free();
-        if pages == 0 {
-            return Err("no physical memory remains for the kernel heap");
-        }
-        let len = pages
-            .checked_mul(PageEntry::PAGE_SIZE)
-            .ok_or("kernel heap size overflow")?;
-        let end = start
-            .into_raw()
-            .checked_add(len)
-            .ok_or("kernel heap address overflow")?;
-        // FIXME: Temporarily make the heap executable so the ELF loader tests pass.
-        // Replace this workaround with dedicated executable mappings for loaded ELF code.
-        self.record_region(
-            start.into_raw(),
-            end,
-            MemFlags::READ | MemFlags::WRITE | MemFlags::EXECUTE,
-        )?;
-        let first =
-            FrameAllocator::alloc_frame(&mut allocator).ok_or("out of kernel heap frames")?;
-        // Reserve all heap frames before allocating any further page tables.
-        // This preserves physical contiguity required by existing DMA buffers.
-        for offset in (PageEntry::PAGE_SIZE..len).step_by(PageEntry::PAGE_SIZE) {
-            let frame = FrameAllocator::alloc_frame(&mut allocator)
-                .ok_or("out of kernel heap frames")?
-                .into_raw();
-            if first.into_raw().checked_add(offset) != Some(frame) {
-                return Err("kernel heap frames must be physically contiguous");
-            }
-        }
-        self.mapper.map_range(
-            start,
-            first,
-            len,
-            MemAttribute {
-                flags: MemFlags::READ | MemFlags::WRITE | MemFlags::EXECUTE | MemFlags::GLOBAL,
-                memory_type: MemType::Normal(CachePolicy::WriteBack),
-            },
-        )?;
-        Ok(end)
-    }
-
     fn bootstrap() -> Result<Self, &'static str> {
         use super::{kernel_virt_to_phys, VirtualAddress};
         use core::ptr::addr_of;
@@ -184,7 +134,6 @@ impl KernelAddressSpace {
             static __bss_start: u8;
             static __sys_stack_start: u8;
             static __sys_stack_end: u8;
-            static __heap_start: u8;
             static _end: u8;
         }
         let physical = |addr: usize| kernel_virt_to_phys(VirtualAddress::new(addr)).into_raw();
@@ -193,7 +142,7 @@ impl KernelAddressSpace {
             .checked_add(crate::boards::PHYS_DRAM_SIZE as usize)
             .ok_or("physical RAM range overflow")?;
         // The linker aligns each boundary to a page. The final boot-table page
-        // is covered too; the heap is mapped separately outside the direct map.
+        // is covered too; heap pages use the writable, non-executable direct map.
         let boundaries = [
             ram_start,
             physical(addr_of!(__text_start) as usize),
@@ -248,18 +197,15 @@ impl KernelAddressSpace {
                 MemType::Device,
             )?;
         }
-        let heap_start = addr_of!(__heap_start) as usize;
-        let heap_end = space.map_heap(VirtualAddress::new(heap_start))?;
-        // SAFETY: the new table covers the running kernel and the newly backed
-        // heap. No heap allocations were needed to construct the static region
-        // metadata or the page tables. Install before writing heap metadata.
+        // SAFETY: these tables cover the kernel and direct-mapped RAM. Static
+        // region metadata and page tables were constructed without heap use.
+        space.mapper.retain_tables();
         unsafe { crate::arch::mmu::activate_kernel_table(space.root_address()) };
-        crate::allocator::init_heap(heap_start as *mut u8, heap_end as *mut u8);
         Ok(space)
     }
 }
 
-pub(crate) fn init_kernel_heap() -> Result<(), &'static str> {
+pub(crate) fn init_kernel_space() -> Result<(), &'static str> {
     KERNEL_SPACE.try_call_once(KernelAddressSpace::bootstrap)?;
     Ok(())
 }

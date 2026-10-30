@@ -15,6 +15,9 @@
 pub mod first_fit;
 pub mod mapper;
 
+#[cfg(test)]
+mod tests;
+
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::mm::{
@@ -132,6 +135,16 @@ pub struct FrameUsage {
     total: usize,
 }
 
+/// Physical page counts, with reserved pages excluded from allocation peaks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrameStats {
+    pub total: usize,
+    pub reserved: usize,
+    pub allocated: usize,
+    pub free: usize,
+    pub peak_allocated: usize,
+}
+
 impl FrameUsage {
     pub fn new(used: usize, total: usize) -> Self {
         FrameUsage { used, total }
@@ -150,8 +163,27 @@ impl FrameUsage {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrameDeallocationError {
+    NotInitialized,
+    InvalidRange,
+    Reserved,
+    NotAllocated,
+}
+
+/// Exclusive ownership of physical page frames.
+///
+/// # Safety
+/// Allocations must be aligned, disjoint, writable through the kernel direct
+/// map, and remain live until explicitly freed. Failed allocation must not
+/// consume frames. Reserved memory must never be returned or freed.
 pub unsafe trait FrameAllocator {
-    // allocate a frame
     fn alloc_frame(&mut self) -> Option<PhysicalAddress>;
+
+    /// # Safety
+    /// The caller must own this live allocation, with no remaining users or
+    /// hardware translations, and must release it exactly once.
+    unsafe fn free_frame(&mut self, frame: PhysicalAddress) -> Result<(), FrameDeallocationError>;
+
     fn usage(&self) -> FrameUsage;
 }

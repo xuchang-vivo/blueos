@@ -74,6 +74,7 @@ unsafe extern "C" {
     pub static mut __bss_end: u8;
     pub static mut __sys_stack_start: u8;
     pub static mut __sys_stack_end: u8;
+    #[cfg(not(paging))]
     pub static mut __heap_start: u8;
     #[cfg(not(paging))]
     pub static mut __heap_end: u8;
@@ -93,6 +94,7 @@ fn init_pin_states<P: blueos_hal::pinctrl::AlterFuncPin>(pin_states: &[&P]) {
 
 extern "C" fn init() {
     boards::init();
+    #[cfg(not(paging))]
     init_heap();
     init_runtime();
     init_pin_states(crate::boards::PIN_STATES);
@@ -258,6 +260,7 @@ pub(crate) fn init_frames() {
     }
 }
 
+#[cfg(not(paging))]
 #[inline(never)]
 pub(crate) fn init_heap() {
     if INIT_HEAP_DONE.load(Ordering::Acquire) {

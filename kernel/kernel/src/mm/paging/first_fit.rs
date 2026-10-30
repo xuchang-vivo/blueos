@@ -12,11 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Global first-fit allocator backed by a static array of physical frame states.
+//! Physical frame ownership backed by a static array of per-page states.
+//!
+//! Paging systems use `instance()` for page tables, kernel heap backing and
+//! user pages. Prefer `alloc_owned_frames` for rollback during construction and
+//! `alloc_zeroed_frame` before exposing a page to users. Guards return frames
+//! on drop; `into_raw` transfers ownership to a mapping's lifecycle manager.
 
-use super::{FrameAllocator, FrameUsage};
+use super::{FrameAllocator, FrameDeallocationError, FrameStats, FrameUsage};
 use crate::{
-    mm::{memory_bank::MemoryRegion, PhysicalAddress},
+    mm::{kernel_phys_to_virt, memory_bank::MemoryRegion, PhysicalAddress},
     sync::SpinLock,
 };
 
@@ -78,28 +83,37 @@ struct AllocatorState {
     base: usize,
     page_size: usize,
     states: &'static mut [FrameState],
-    // Allocation is monotonic: pages below this index can never become free.
+    // No free frame exists below this index. Freeing updates the cursor.
     first_free: usize,
+    reserved: usize,
+    allocated: usize,
+    free: usize,
+    peak_allocated: usize,
 }
 
-/// A single shared allocator, accessed through [`Self::instance`].
+/// The system's shared allocator is accessed through [`Self::instance`].
 ///
 /// The caller supplies a static state array at initialization. Pages containing
 /// the kernel, metadata, or other live objects must not be marked free.
+/// Independently constructed allocators must own disjoint backing memory.
 pub struct FirstFitFrameAllocator {
     state: SpinLock<Option<AllocatorState>>,
 }
 
-static FIRST_FIT: FirstFitFrameAllocator = FirstFitFrameAllocator {
-    state: SpinLock::new(None),
-};
+static FIRST_FIT: FirstFitFrameAllocator = FirstFitFrameAllocator::new();
 
 impl FirstFitFrameAllocator {
+    pub const fn new() -> Self {
+        Self {
+            state: SpinLock::new(None),
+        }
+    }
+
     pub fn instance() -> &'static Self {
         &FIRST_FIT
     }
 
-    /// Initialize the singleton for `[base, base + N * page_size)`.
+    /// Initialize this allocator for `[base, base + N * page_size)`.
     ///
     /// Returns `None` if already initialized, the page size is not a nonzero
     /// power of two, the base is misaligned, or the physical range overflows.
@@ -107,7 +121,8 @@ impl FirstFitFrameAllocator {
     /// # Safety
     /// Free pages must be valid RAM exclusively owned by this allocator and
     /// must not overlap any live objects, including the allocator itself.
-    /// The RAM must remain valid for the lifetime of all returned frames.
+    /// Every free page must be writable through the kernel direct map. The RAM
+    /// must remain valid for the lifetime of all returned frames.
     pub unsafe fn init<const N: usize>(
         &self,
         base: PhysicalAddress,
@@ -124,11 +139,28 @@ impl FirstFitFrameAllocator {
         if state.is_some() {
             return None;
         }
+        let free = states
+            .iter()
+            .filter(|state| **state == FrameState::Free)
+            .count();
+        let first_free = states
+            .iter()
+            .position(|state| *state == FrameState::Free)
+            .unwrap_or(states.len());
+        let reserved = states
+            .iter()
+            .filter(|state| **state == FrameState::Reserved)
+            .count();
+        let allocated = states.len() - reserved - free;
         *state = Some(AllocatorState {
             base,
             page_size,
             states,
-            first_free: 0,
+            first_free,
+            reserved,
+            allocated,
+            free,
+            peak_allocated: allocated,
         });
         Some(())
     }
@@ -136,34 +168,220 @@ impl FirstFitFrameAllocator {
     pub fn usage(&self) -> Option<FrameUsage> {
         let state = self.state.irqsave_lock();
         let state = state.as_ref()?;
-        let free = state.states[state.first_free..]
-            .iter()
-            .filter(|state| **state == FrameState::Free)
-            .count();
         Some(FrameUsage::new(
-            state.states.len() - free,
+            state.states.len() - state.free,
             state.states.len(),
         ))
     }
 
-    /// Return the lowest-address free frame, or `None` before initialization
-    /// or when all frames are reserved or allocated.
+    /// Snapshot the physical frame counts under the allocator lock.
+    pub fn frame_stats(&self) -> Option<FrameStats> {
+        let state = self.state.irqsave_lock();
+        let state = state.as_ref()?;
+        Some(FrameStats {
+            total: state.states.len(),
+            reserved: state.reserved,
+            allocated: state.allocated,
+            free: state.free,
+            peak_allocated: state.peak_allocated,
+        })
+    }
+
+    /// Return the longest contiguous free run, in pages.
+    pub fn largest_free_run(&self) -> Option<usize> {
+        let state = self.state.irqsave_lock();
+        let state = state.as_ref()?;
+        let mut largest = 0;
+        let mut run = 0;
+        for frame in &state.states[state.first_free..] {
+            if *frame == FrameState::Free {
+                run += 1;
+                largest = largest.max(run);
+            } else {
+                run = 0;
+            }
+        }
+        Some(largest)
+    }
+
+    /// Allocate one frame without clearing its previous contents.
     pub fn alloc_frame(&self) -> Option<PhysicalAddress> {
+        self.alloc_frames(1)
+    }
+
+    /// Allocate a contiguous run atomically, leaving state unchanged on failure.
+    /// The returned pages are owned by the caller until `free_frames`.
+    pub fn alloc_frames(&self, count: usize) -> Option<PhysicalAddress> {
+        self.alloc_frames_aligned(count, 1)
+    }
+
+    /// Allocate contiguous pages aligned to an absolute physical address.
+    /// `align_pages` must be a nonzero power of two. Invalid requests and
+    /// searches without a suitable run leave all allocator state unchanged.
+    pub fn alloc_frames_aligned(
+        &self,
+        count: usize,
+        align_pages: usize,
+    ) -> Option<PhysicalAddress> {
         let mut state = self.state.irqsave_lock();
         let state = state.as_mut()?;
-        let start = state.first_free;
-        let Some(offset) = state.states[start..]
-            .iter()
-            .position(|state| *state == FrameState::Free)
-        else {
-            state.first_free = state.states.len();
+        if count == 0 || count > state.free || !align_pages.is_power_of_two() {
             return None;
-        };
-        let index = start + offset;
-        state.states[index] = FrameState::Allocated;
-        state.first_free = index + 1;
-        // Initialization checked the entire physical range for overflow.
-        Some(PhysicalAddress::new(state.base + index * state.page_size))
+        }
+        count.checked_mul(state.page_size)?;
+        let align_bytes = align_pages.checked_mul(state.page_size)?;
+        let mut run = 0;
+        let mut found = None;
+        for index in state.first_free..state.states.len() {
+            if state.states[index] == FrameState::Free {
+                run += 1;
+                if run >= count {
+                    let first = index + 1 - count;
+                    let start_addr = state
+                        .base
+                        .checked_add(first.checked_mul(state.page_size)?)?;
+                    if start_addr & (align_bytes - 1) != 0 {
+                        continue;
+                    }
+                    found = Some((first, start_addr));
+                    break;
+                }
+            } else {
+                run = 0;
+            }
+        }
+        let (first, start_addr) = found?;
+        state.states[first..first + count].fill(FrameState::Allocated);
+        state.allocated += count;
+        state.free -= count;
+        state.peak_allocated = state.peak_allocated.max(state.allocated);
+        // A fragmented run may have been skipped; preserve its free pages.
+        if first == state.first_free {
+            let end = first + count;
+            state.first_free = state.states[end..]
+                .iter()
+                .position(|frame| *frame == FrameState::Free)
+                .map_or(state.states.len(), |offset| end + offset);
+        }
+        Some(PhysicalAddress::new(start_addr))
+    }
+
+    /// # Safety
+    /// `frame` must be exclusively owned by the caller, no longer mapped or in
+    /// use by any CPU/device, and returned by this allocator.
+    pub unsafe fn free_frame(&self, frame: PhysicalAddress) -> Result<(), FrameDeallocationError> {
+        unsafe { self.free_frames(frame, 1) }
+    }
+
+    /// Release a contiguous allocation, validating the entire range first.
+    /// Errors leave every frame unchanged. Checks diagnose invalid addresses,
+    /// reserved frames and duplicate frees; they cannot establish ownership.
+    ///
+    /// # Safety
+    /// The caller must own all `count` pages and ensure no references, active
+    /// mappings, or device accesses remain. Do not release pages still owned by
+    /// a `FrameAllocation`.
+    pub unsafe fn free_frames(
+        &self,
+        frame: PhysicalAddress,
+        count: usize,
+    ) -> Result<(), FrameDeallocationError> {
+        let mut state = self.state.irqsave_lock();
+        let state = state
+            .as_mut()
+            .ok_or(FrameDeallocationError::NotInitialized)?;
+        let offset = frame
+            .into_raw()
+            .checked_sub(state.base)
+            .filter(|offset| offset & (state.page_size - 1) == 0)
+            .ok_or(FrameDeallocationError::InvalidRange)?;
+        let first = offset / state.page_size;
+        let end = first
+            .checked_add(count)
+            .filter(|end| count != 0 && *end <= state.states.len())
+            .ok_or(FrameDeallocationError::InvalidRange)?;
+        for frame in &state.states[first..end] {
+            match frame {
+                FrameState::Reserved => return Err(FrameDeallocationError::Reserved),
+                FrameState::Free => return Err(FrameDeallocationError::NotAllocated),
+                FrameState::Allocated => {}
+            }
+        }
+        state.states[first..end].fill(FrameState::Free);
+        state.allocated -= count;
+        state.free += count;
+        state.first_free = state.first_free.min(first);
+        Ok(())
+    }
+
+    /// Allocate an owned run which is automatically released on failure paths.
+    pub fn alloc_owned_frames(&self, count: usize) -> Option<FrameAllocation<'_>> {
+        self.alloc_owned_frames_aligned(count, 1)
+    }
+
+    /// Allocate an aligned run with automatic rollback until ownership transfer.
+    pub fn alloc_owned_frames_aligned(
+        &self,
+        count: usize,
+        align_pages: usize,
+    ) -> Option<FrameAllocation<'_>> {
+        Some(FrameAllocation {
+            allocator: self,
+            start: self.alloc_frames_aligned(count, align_pages)?,
+            count,
+        })
+    }
+
+    /// Allocate a cleared page suitable for exposing to a user address space.
+    /// Clearing finishes before ownership is returned to the caller.
+    pub fn alloc_zeroed_frame(&self) -> Option<FrameAllocation<'_>> {
+        let frame = self.alloc_owned_frames(1)?;
+        let page_size = self.state.irqsave_lock().as_ref()?.page_size;
+        let ptr = kernel_phys_to_virt(frame.start).into_raw() as *mut u8;
+        // SAFETY: init guarantees writable direct-map backing; frame owns it.
+        unsafe { ptr.write_bytes(0, page_size) };
+        Some(frame)
+    }
+}
+
+impl Default for FirstFitFrameAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Exclusive ownership of a contiguous run of physical frames.
+/// Drop releases the run; transfer ownership explicitly with `into_raw` when
+/// publishing it in a mapping. Hardware users must be stopped before drop.
+#[must_use = "dropping the allocation immediately releases its physical frames"]
+pub struct FrameAllocation<'a> {
+    allocator: &'a FirstFitFrameAllocator,
+    start: PhysicalAddress,
+    count: usize,
+}
+
+impl FrameAllocation<'_> {
+    pub fn address(&self) -> PhysicalAddress {
+        self.start
+    }
+
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    /// Transfer responsibility for releasing the frames to the caller.
+    pub fn into_raw(self) -> PhysicalAddress {
+        let start = self.start;
+        core::mem::forget(self);
+        start
+    }
+}
+
+impl Drop for FrameAllocation<'_> {
+    fn drop(&mut self) {
+        // SAFETY: this guard owns the run until drop or into_raw.
+        unsafe { self.allocator.free_frames(self.start, self.count) }
+            .expect("invalid owned frame allocation");
     }
 }
 
@@ -173,6 +391,10 @@ impl FirstFitFrameAllocator {
 unsafe impl FrameAllocator for &FirstFitFrameAllocator {
     fn alloc_frame(&mut self) -> Option<PhysicalAddress> {
         FirstFitFrameAllocator::alloc_frame(self)
+    }
+
+    unsafe fn free_frame(&mut self, frame: PhysicalAddress) -> Result<(), FrameDeallocationError> {
+        unsafe { FirstFitFrameAllocator::free_frame(self, frame) }
     }
 
     fn usage(&self) -> FrameUsage {

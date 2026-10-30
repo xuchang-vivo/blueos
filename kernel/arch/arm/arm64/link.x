@@ -81,7 +81,4 @@ SECTIONS
     }
     _end = .;
 
-    /* Keep the heap outside the 32-bit physical direct-map aperture. Its RAM
-       backing is allocated by FirstFit and mapped before heap initialization. */
-    __heap_start = CONFIG_KERNEL_VIRT_OFFSET + 0x100000000;
 }
