@@ -30,6 +30,11 @@ use core::{
 struct CountingSource {
     inner: FirstFitSource,
     fail_next: AtomicBool,
+    two_page_slab_next: AtomicBool,
+    #[cfg(smp)]
+    race_enabled: AtomicBool,
+    #[cfg(smp)]
+    arrived: AtomicUsize,
     free_run_override: AtomicUsize,
     live_pages: AtomicUsize,
     probe: SpinLock<Option<Weak<PageHeap<CountingSource>>>>,
@@ -39,6 +44,11 @@ impl CountingSource {
         Self {
             inner: FirstFitSource,
             fail_next: AtomicBool::new(false),
+            two_page_slab_next: AtomicBool::new(false),
+            #[cfg(smp)]
+            race_enabled: AtomicBool::new(false),
+            #[cfg(smp)]
+            arrived: AtomicUsize::new(0),
             free_run_override: AtomicUsize::new(usize::MAX),
             live_pages: AtomicUsize::new(0),
             probe: SpinLock::new(None),
@@ -55,15 +65,26 @@ impl CountingSource {
         }
     }
 }
-// SAFETY: forwards exclusive ownership to/from the real frame source.
+// SAFETY: forwards exclusive, mapped spans to/from the real frame source.
+// The explicit fault mode violates only the single-page size requirement to
+// exercise rejection of a malformed candidate; both pages remain owned.
 unsafe impl PageSource for CountingSource {
-    fn allocate(&self, request: PageRequest) -> Option<PageSpan> {
+    fn allocate(&self, mut request: PageRequest) -> Option<PageSpan> {
         self.assert_unlocked();
         if self.fail_next.swap(false, Ordering::AcqRel) {
             return None;
         }
+        if self.two_page_slab_next.swap(false, Ordering::AcqRel) {
+            assert_eq!(request.pages, 1);
+            request.pages = 2;
+        }
         let span = self.inner.allocate(request)?;
         self.live_pages.fetch_add(span.pages(), Ordering::AcqRel);
+        #[cfg(smp)]
+        if self.race_enabled.load(Ordering::Acquire) {
+            self.arrived.fetch_add(1, Ordering::AcqRel);
+            wait_until(|| self.arrived.load(Ordering::Acquire) >= 2);
+        }
         Some(span)
     }
     unsafe fn release(&self, span: PageSpan) {
@@ -143,6 +164,212 @@ impl Drop for KernelFixture {
             crate::boards::PHYS_DRAM_SIZE as usize / PAGE_SIZE
         );
     }
+}
+
+#[cfg(smp)]
+fn wait_until(mut ready: impl FnMut() -> bool) {
+    let deadline = crate::time::Tick::after(crate::time::Tick::from_millis(5000));
+    while !ready() {
+        assert!(!deadline.is_elapsed(), "page heap worker timed out");
+        crate::scheduler::yield_me();
+    }
+}
+
+// Catches omitted second checks and leaked redundant candidates. Both workers
+// own real candidate pages before either is allowed to publish its slab.
+#[cfg(smp)]
+#[test]
+fn concurrent_refill_returns_redundant_candidate_while_objects_are_live() {
+    let f = KernelFixture::new();
+    // A try_lock probe cannot distinguish this caller from another CPU's lock.
+    *f.heap.source.probe.irqsave_lock() = None;
+    f.heap.source.race_enabled.store(true, Ordering::Release);
+    let addresses = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+    let release = Arc::new(AtomicBool::new(false));
+    let completed = Arc::new(AtomicUsize::new(0));
+    for worker in 0..2 {
+        let heap = f.heap.clone();
+        let addresses = addresses.clone();
+        let release = release.clone();
+        let completed = completed.clone();
+        crate::thread::spawn(move || {
+            let layout = Layout::from_size_align(64, 8).unwrap();
+            let object = heap.alloc(layout).unwrap();
+            unsafe { object.as_ptr().write_bytes(0x31 + worker as u8, 64) };
+            addresses[worker].store(object.as_ptr().addr(), Ordering::Release);
+            wait_until(|| release.load(Ordering::Acquire));
+            for offset in 0..64 {
+                assert_eq!(
+                    unsafe { object.as_ptr().add(offset).read() },
+                    0x31 + worker as u8
+                );
+            }
+            unsafe { heap.dealloc(object.as_ptr(), layout) };
+            // Completion must not race fixture teardown or its Arc assertion.
+            drop(heap);
+            completed.fetch_add(1, Ordering::Release);
+        })
+        .expect("spawn page heap refill worker");
+    }
+    wait_until(|| {
+        addresses
+            .iter()
+            .all(|address| address.load(Ordering::Acquire) != 0)
+    });
+    assert_ne!(
+        addresses[0].load(Ordering::Acquire),
+        addresses[1].load(Ordering::Acquire)
+    );
+    assert_eq!(f.heap.source.arrived.load(Ordering::Acquire), 2);
+    let stats = f.heap.heap_stats();
+    assert_eq!(stats.live_objects, 2);
+    assert_eq!(stats.slab_pages, 1);
+    assert_eq!(stats.backing_bytes, PAGE_SIZE);
+    assert_eq!(f.heap.source.live_pages.load(Ordering::Acquire), 1);
+    release.store(true, Ordering::Release);
+    wait_until(|| completed.load(Ordering::Acquire) == 2);
+    assert_eq!(f.heap.source.live_pages.load(Ordering::Acquire), 0);
+    assert_eq!(f.heap.heap_stats().backing_bytes, 0);
+    assert_eq!(f.heap.heap_stats().live_objects, 0);
+}
+
+// Catches retaining the old 16 MiB cap and failing to return/reuse large runs.
+#[test]
+fn private_heap_grows_past_old_fixed_capacity_and_returns_all_pages() {
+    let f = KernelFixture::new();
+    assert_eq!(f.heap.heap_stats().backing_bytes, 0);
+    let layout = Layout::from_size_align(20 * 1024 * 1024, PAGE_SIZE).unwrap();
+    for _ in 0..3 {
+        let buffer = f.heap.alloc(layout).unwrap();
+        unsafe {
+            buffer.as_ptr().write(0x11);
+            buffer.as_ptr().add(layout.size() - 1).write(0x22);
+        }
+        assert_eq!(unsafe { buffer.as_ptr().read() }, 0x11);
+        assert_eq!(
+            unsafe { buffer.as_ptr().add(layout.size() - 1).read() },
+            0x22
+        );
+        assert!(f.heap.heap_stats().backing_bytes > 16 * 1024 * 1024);
+        assert_eq!(f.heap.source.live_pages.load(Ordering::Acquire), 5120);
+        unsafe { f.heap.dealloc(buffer.as_ptr(), layout) };
+        assert_eq!(f.heap.source.live_pages.load(Ordering::Acquire), 0);
+        assert_eq!(f.heap.heap_stats().backing_bytes, 0);
+    }
+}
+
+// Catches satisfying a contiguous request using scattered physical pages or
+// dropping high alignment when obtaining a new run from the frame allocator.
+#[test]
+fn private_heap_allocations_are_physically_contiguous() {
+    use crate::mm::{kernel_virt_to_phys, VirtualAddress};
+    let f = KernelFixture::new();
+    for size in [1025, 4096, 4097, 65537] {
+        for align in [8, 4096, 65536] {
+            let layout = Layout::from_size_align(size, align).unwrap();
+            let buffer = f.heap.alloc(layout).unwrap();
+            let start = buffer.as_ptr().addr();
+            let physical = kernel_virt_to_phys(VirtualAddress::new(start)).into_raw();
+            assert_eq!(start % align, 0);
+            assert_eq!(physical % align, 0);
+            for offset in (0..size).step_by(PAGE_SIZE) {
+                assert_eq!(
+                    kernel_virt_to_phys(VirtualAddress::new(start + offset)).into_raw(),
+                    physical + offset
+                );
+                unsafe { buffer.as_ptr().add(offset).write(0xa5) };
+            }
+            assert_eq!(
+                kernel_virt_to_phys(VirtualAddress::new(start + size - 1)).into_raw(),
+                physical + size - 1
+            );
+            for offset in (0..size).step_by(PAGE_SIZE) {
+                assert_eq!(unsafe { buffer.as_ptr().add(offset).read() }, 0xa5);
+            }
+            unsafe { f.heap.dealloc(buffer.as_ptr(), layout) };
+            assert_eq!(f.heap.source.live_pages.load(Ordering::Acquire), 0);
+        }
+    }
+}
+
+// Catches OOM or candidate rejection changing live objects, their owner entries,
+// or accounting; malformed candidates must return both real backing pages.
+#[test]
+fn failed_refills_and_publication_preserve_existing_objects() {
+    let f = KernelFixture::new();
+    let small_layout = Layout::from_size_align(64, 8).unwrap();
+    let large_layout = Layout::from_size_align(4097, 4096).unwrap();
+    let small = f.heap.alloc(small_layout).unwrap();
+    let large = f.heap.alloc(large_layout).unwrap();
+    unsafe {
+        small.as_ptr().write_bytes(0x53, small_layout.size());
+        large.as_ptr().write_bytes(0xa7, large_layout.size());
+    }
+    let stats = f.heap.heap_stats();
+    let snapshot = |info: allocator_crate::page_heap::AllocationInfo| {
+        (
+            info.kind,
+            info.requested_size,
+            info.capacity,
+            info.align,
+            info.span,
+        )
+    };
+    let (small_info, large_info) = {
+        let guard = f.heap.state.irqsave_lock();
+        let raw = guard.as_ref().unwrap();
+        (
+            snapshot(raw.allocation_info(small).unwrap()),
+            snapshot(raw.allocation_info(large).unwrap()),
+        )
+    };
+    assert_eq!(f.heap.source.live_pages.load(Ordering::Acquire), 3);
+    for fault in 0..3 {
+        let request = match fault {
+            0 => {
+                f.heap.source.fail_next.store(true, Ordering::Release);
+                Layout::from_size_align(128, 8).unwrap()
+            }
+            1 => {
+                f.heap.source.fail_next.store(true, Ordering::Release);
+                Layout::from_size_align(65537, 65536).unwrap()
+            }
+            _ => {
+                f.heap
+                    .source
+                    .two_page_slab_next
+                    .store(true, Ordering::Release);
+                Layout::from_size_align(128, 8).unwrap()
+            }
+        };
+        assert!(f.heap.alloc(request).is_none());
+        assert!(!f.heap.source.fail_next.load(Ordering::Acquire));
+        assert!(!f.heap.source.two_page_slab_next.load(Ordering::Acquire));
+        assert_eq!(f.heap.heap_stats(), stats);
+        assert_eq!(f.heap.source.live_pages.load(Ordering::Acquire), 3);
+        {
+            let guard = f.heap.state.irqsave_lock();
+            let raw = guard.as_ref().unwrap();
+            assert_eq!(snapshot(raw.allocation_info(small).unwrap()), small_info);
+            assert_eq!(snapshot(raw.allocation_info(large).unwrap()), large_info);
+        }
+        for offset in 0..small_layout.size() {
+            assert_eq!(unsafe { small.as_ptr().add(offset).read() }, 0x53);
+        }
+        for offset in 0..large_layout.size() {
+            assert_eq!(unsafe { large.as_ptr().add(offset).read() }, 0xa7);
+        }
+    }
+    // A successful retry proves failure did not poison publication or ownership.
+    let retry_layout = Layout::from_size_align(128, 8).unwrap();
+    let retry = f.heap.alloc(retry_layout).unwrap();
+    unsafe {
+        f.heap.dealloc(retry.as_ptr(), retry_layout);
+        f.heap.dealloc(small.as_ptr(), small_layout);
+        f.heap.dealloc(large.as_ptr(), large_layout);
+    }
+    assert_eq!(f.heap.source.live_pages.load(Ordering::Acquire), 0);
+    assert_eq!(f.heap.heap_stats().backing_bytes, 0);
 }
 
 // Catches leaked OOM candidates, missing final-page return, wrong alignment,

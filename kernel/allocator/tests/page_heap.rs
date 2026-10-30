@@ -284,6 +284,70 @@ fn slab_rechecks_existing_capacity_and_returns_last_page() {
     assert_eq!(f.heap.stats().live_objects, 0);
 }
 
+// Catches partial owner/stat publication or payload damage on rejected runs.
+// Every candidate is backed by a real arena, including the out-of-window case.
+#[test]
+fn rejected_publication_preserves_live_data_and_allows_candidate_reuse() {
+    let mut f = Fixture::new(8);
+    let mut outside = Fixture::new(2);
+    let layout = Layout::from_size_align(4097, 8).unwrap();
+    let span = f.take(2, PAGE_SIZE).unwrap();
+    let live = unsafe { f.heap.commit_large(span, layout) }.unwrap();
+    unsafe { live.ptr.as_ptr().write_bytes(0x7b, layout.size()) };
+    let before = f.heap.stats();
+    let candidate = f.take(2, PAGE_SIZE).unwrap();
+    let foreign = outside.take(2, PAGE_SIZE).unwrap();
+    for (rejected, request, error) in [
+        (span, layout, HeapError::Conflict),
+        (foreign, layout, HeapError::OutOfWindow),
+        (
+            candidate,
+            Layout::from_size_align(8193, 8).unwrap(),
+            HeapError::InvalidRequest,
+        ),
+    ] {
+        assert_eq!(
+            unsafe { f.heap.commit_large(rejected, request) },
+            Err(error)
+        );
+        assert_eq!(f.heap.stats(), before);
+        assert_eq!(f.free_pages(), 4);
+        let info = f.heap.allocation_info(live.ptr).unwrap();
+        assert_eq!(info.kind, AllocationKind::Large);
+        assert_eq!(info.span, span);
+        assert_eq!(info.requested_size, Some(4097));
+        assert_eq!(info.capacity, 8192);
+        assert_eq!(info.align, 8);
+        for offset in 0..layout.size() {
+            assert_eq!(unsafe { live.ptr.as_ptr().add(offset).read() }, 0x7b);
+        }
+        assert_eq!(
+            f.heap.allocation_info(candidate.start()).unwrap_err(),
+            HeapError::NotAllocated
+        );
+    }
+    // The raw core leaves rejected runs with the caller, which returns them.
+    outside.release(foreign);
+    f.release(candidate);
+    assert_eq!(outside.free_pages(), 2);
+    assert_eq!(f.free_pages(), 6);
+    let reused = f.take(2, PAGE_SIZE).unwrap();
+    assert_eq!(reused, candidate);
+    let retry = unsafe { f.heap.commit_large(reused, layout) }.unwrap();
+    assert_eq!(f.heap.stats().live_objects, 2);
+    for allocation in [retry, live] {
+        let ReleaseAction::Pages(run) =
+            (unsafe { f.heap.free(allocation.ptr, Some(layout)) }).unwrap()
+        else {
+            panic!("large allocation must return every page");
+        };
+        f.release(run);
+    }
+    assert_eq!(f.free_pages(), 8);
+    assert_eq!(f.heap.stats().backing_bytes, 0);
+    assert_eq!(f.heap.stats().live_objects, 0);
+}
+
 #[test]
 fn all_slab_classes_preserve_payloads_and_reclaim_full_pages() {
     for size in CLASS_SIZES {
