@@ -528,3 +528,100 @@ fn frame_concurrent_allocations_remain_exclusive_across_yields() {
         scheduler::yield_me();
     }
 }
+
+#[test]
+fn carve_ram_holes_excludes_reserved_and_aligns() {
+    use crate::mm::kernel_space::carve_ram_holes;
+    let region = |base: usize, size: usize, reserved: bool| MemoryRegion {
+        base: PhysicalAddress::new(base),
+        size,
+        is_reserved: reserved,
+        flags: MemFlags::READ | MemFlags::WRITE,
+        name: "test",
+    };
+    let ram = region(0x1000_0000, 0x4_0000, false);
+    let reserved = [
+        region(0x1001_0000, 0x1_0000, true),
+        region(0x1002_0000, 0x1_0000, true),
+    ];
+    let holes = carve_ram_holes(&ram, reserved.iter()).unwrap();
+    assert_eq!(
+        holes.as_slice(),
+        [
+            (PhysicalAddress::new(0x1000_0000), 0x1_0000),
+            (PhysicalAddress::new(0x1003_0000), 0x1_0000),
+        ]
+    );
+}
+
+#[test]
+fn carve_ram_holes_rejects_non_page_aligned() {
+    use crate::mm::kernel_space::carve_ram_holes;
+    let region = |base: usize, size: usize, reserved: bool| MemoryRegion {
+        base: PhysicalAddress::new(base),
+        size,
+        is_reserved: reserved,
+        flags: MemFlags::READ | MemFlags::WRITE,
+        name: "test",
+    };
+    let ram = region(0x2000_0000, 4 * PAGE_SIZE, false);
+    let misaligned_base = [region(0x2000_1001, 2 * PAGE_SIZE, true)];
+    assert!(carve_ram_holes(&ram, misaligned_base.iter()).is_err());
+    let misaligned_end = [region(0x2000_2000, PAGE_SIZE + 1, true)];
+    assert!(carve_ram_holes(&ram, misaligned_end.iter()).is_err());
+    let aligned = [region(0x2000_2000, PAGE_SIZE, true)];
+    assert!(carve_ram_holes(&ram, aligned.iter()).is_ok());
+}
+
+
+#[test]
+fn carve_ram_holes_full_overlap() {
+    use crate::mm::kernel_space::carve_ram_holes;
+    let region = |base: usize, size: usize, reserved: bool| MemoryRegion {
+        base: PhysicalAddress::new(base),
+        size,
+        is_reserved: reserved,
+        flags: MemFlags::READ | MemFlags::WRITE,
+        name: "test",
+    };
+    let ram = region(0x4000_0000, 2 * PAGE_SIZE, false);
+    let reserved = [region(0x4000_0000, 2 * PAGE_SIZE, true)];
+    let holes = carve_ram_holes(&ram, reserved.iter()).unwrap();
+    assert_eq!(holes.as_slice(), []);
+}
+
+#[test]
+fn carve_ram_holes_partial_prefix() {
+    use crate::mm::kernel_space::carve_ram_holes;
+    let region = |base: usize, size: usize, reserved: bool| MemoryRegion {
+        base: PhysicalAddress::new(base),
+        size,
+        is_reserved: reserved,
+        flags: MemFlags::READ | MemFlags::WRITE,
+        name: "test",
+    };
+    let ram = region(0x5000_0000, 3 * PAGE_SIZE, false);
+    let reserved = [region(0x5000_0000, PAGE_SIZE, true)];
+    let holes = carve_ram_holes(&ram, reserved.iter()).unwrap();
+    assert_eq!(holes.as_slice(), [(PhysicalAddress::new(0x5000_1000), 2 * PAGE_SIZE)]);
+}
+
+#[test]
+fn carve_ram_holes_multiple_reserved() {
+    use crate::mm::kernel_space::carve_ram_holes;
+    let region = |base: usize, size: usize, reserved: bool| MemoryRegion {
+        base: PhysicalAddress::new(base),
+        size,
+        is_reserved: reserved,
+        flags: MemFlags::READ | MemFlags::WRITE,
+        name: "test",
+    };
+    let ram = region(0x6000_0000, 5 * PAGE_SIZE, false);
+    let reserved = [region(0x6000_1000, PAGE_SIZE, true), region(0x6000_3000, PAGE_SIZE, true)];
+    let holes = carve_ram_holes(&ram, reserved.iter()).unwrap();
+    assert_eq!(holes.as_slice(), [
+        (PhysicalAddress::new(0x6000_0000), PAGE_SIZE),
+        (PhysicalAddress::new(0x6000_2000), PAGE_SIZE),
+        (PhysicalAddress::new(0x6000_4000), PAGE_SIZE),
+    ]);
+}
