@@ -120,6 +120,11 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
         None
     }
 
+    #[cfg(test)]
+    pub(crate) fn leaf_descriptor(&self, addr: usize) -> Option<usize> {
+        self.leaf_entry(addr)
+    }
+
     /// Translate a mapped address, including its offset within the page.
     pub fn translate(&self, addr: usize) -> Option<PhysicalAddress> {
         let frame = P::table_address(self.leaf_entry(addr)?)?;
@@ -184,6 +189,12 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
         len: usize,
         attributes: MemAttribute,
     ) -> Result<(), &'static str> {
+        if attributes
+            .flags
+            .contains(MemFlags::WRITE | MemFlags::EXECUTE)
+        {
+            return Err("writable executable mappings are not supported");
+        }
         if len == 0 {
             return Ok(());
         }

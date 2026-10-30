@@ -442,21 +442,46 @@ fn page_table_cleanup_keeps_leaf_backing_owned_by_caller() {
 }
 
 #[test]
-fn boot_heap_keeps_runtime_frames_and_excludes_its_backing() {
-    let allocator = FirstFitFrameAllocator::instance();
-    assert!(allocator.usage().unwrap().free() > 0);
-    let frame = allocator
+fn boot_runtime_frames_do_not_overlap_live_heap_buffers() {
+    let buffer = alloc::vec![0xa5u8; 2 * PAGE_SIZE];
+    let start = kernel_virt_to_phys(VirtualAddress::new(buffer.as_ptr() as usize)).into_raw();
+    let page = FirstFitFrameAllocator::instance()
         .alloc_zeroed_frame()
-        .expect("runtime frame after heap initialization");
-    let kernel = crate::mm::kernel_space::KernelAddressSpace::get().unwrap();
-    assert_eq!(
-        kernel.translate(kernel_phys_to_virt(frame.address()).into_raw()),
-        Some(frame.address())
-    );
-    // Every successful allocation is checked against live heap backing, without
-    // depending on global frame counts while other tests run concurrently.
-    let heap_base = kernel.heap_physical_range();
-    assert!(frame.address().into_raw() < heap_base.0 || frame.address().into_raw() >= heap_base.1);
+        .unwrap();
+    assert!(page.address().into_raw() < start || page.address().into_raw() >= start + buffer.len());
+    assert!(buffer.iter().all(|byte| *byte == 0xa5));
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn heap_backing_uses_privileged_non_executable_leaf_entries() {
+    let buffer = alloc::vec![0u8; PAGE_SIZE];
+    let space = crate::mm::kernel_space::KernelAddressSpace::get().unwrap();
+    let entry = space.leaf_descriptor(buffer.as_ptr() as usize).unwrap();
+    assert_ne!(entry & (1usize << 53), 0); // AArch64 PXN
+    assert_ne!(entry & (1usize << 54), 0); // AArch64 UXN
+    assert_eq!((entry >> 6) & 0b11, 0); // AP: privileged read/write
+    assert_eq!(entry & (1usize << 11), 0); // nG: global kernel mapping
+}
+
+#[test]
+fn writable_executable_mapping_is_rejected_without_allocating_tables() {
+    let fixture = Fixture::new([FrameState::Free; 8]);
+    let mut mapper = unsafe { PageMapper::<_>::create(&fixture.allocator) }.unwrap();
+    let before = fixture.allocator.frame_stats().unwrap();
+    assert!(mapper
+        .map_range(
+            VirtualAddress::new(0x8000),
+            fixture.base(),
+            PAGE_SIZE,
+            MemAttribute {
+                flags: MemFlags::READ | MemFlags::WRITE | MemFlags::EXECUTE,
+                memory_type: MemType::Normal(CachePolicy::WriteBack),
+            },
+        )
+        .is_err());
+    assert_eq!(mapper.translate(0x8000), None);
+    assert_eq!(fixture.allocator.frame_stats().unwrap(), before);
 }
 
 #[test]

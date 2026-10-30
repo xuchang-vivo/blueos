@@ -64,7 +64,7 @@ pub const fn kernel_phys_to_virt(addr: PhysicalAddress) -> VirtualAddress {
 
 #[inline]
 pub fn kernel_virt_to_phys(addr: VirtualAddress) -> PhysicalAddress {
-    // The heap has separately allocated backing and is not a linear alias.
+    // Validate translations against the published permanent kernel mappings.
     // Before the new tables are published, only boot direct-map addresses
     // are translated here.
     #[cfg(paging)]
