@@ -26,6 +26,10 @@ use crate::{
 };
 use core::ptr::addr_of_mut;
 
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;
+
 const PHYS_BASE: usize = crate::boards::PHYS_DRAM_BASE as usize;
 const PAGE_SIZE: usize = <crate::arch::page::PageEntry as PageFormat>::PAGE_SIZE;
 const FRAME_COUNT: usize = crate::boards::PHYS_DRAM_SIZE as usize / PAGE_SIZE;

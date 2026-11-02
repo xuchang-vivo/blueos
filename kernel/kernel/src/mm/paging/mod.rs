@@ -15,9 +15,6 @@
 pub mod first_fit;
 pub mod mapper;
 
-#[cfg(test)]
-mod tests;
-
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::mm::{

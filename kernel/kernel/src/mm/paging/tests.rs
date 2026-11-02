@@ -12,14 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{
-    first_fit::{init_frame_states, FirstFitFrameAllocator, FrameState},
-    mapper::PageMapper,
-    FrameDeallocationError, FrameStats, PageFormat,
-};
+use super::{AllocatorState, FirstFitFrameAllocator, FrameState};
 use crate::mm::{
-    kernel_phys_to_virt, kernel_virt_to_phys, memory_bank::MemoryRegion, CachePolicy, MemAttribute,
-    MemFlags, MemType, PhysicalAddress, VirtualAddress,
+    kernel_phys_to_virt, kernel_virt_to_phys,
+    memory_bank::MemoryRegion,
+    paging::{mapper::PageMapper, FrameDeallocationError, FrameStats, PageFormat},
+    CachePolicy, MemAttribute, MemFlags, MemType, PhysicalAddress, VirtualAddress,
 };
 use alloc::{
     alloc::{alloc, dealloc, Layout},
@@ -42,24 +40,46 @@ struct Fixture<const N: usize> {
 }
 
 impl<const N: usize> Fixture<N> {
+    // Test allocators own private metadata instead of reinitializing the
+    // kernel's global STATES through the boot-only init interface.
+    fn allocator(
+        base: PhysicalAddress,
+        states: &'static mut [FrameState],
+    ) -> FirstFitFrameAllocator {
+        let free = states.iter().filter(|s| **s == FrameState::Free).count();
+        let reserved = states
+            .iter()
+            .filter(|s| **s == FrameState::Reserved)
+            .count();
+        let allocated = states.len() - free - reserved;
+        let first_free = states
+            .iter()
+            .position(|s| *s == FrameState::Free)
+            .unwrap_or(states.len());
+        FirstFitFrameAllocator {
+            state: crate::sync::SpinLock::new(Some(AllocatorState {
+                base: base.into_raw(),
+                page_size: PAGE_SIZE,
+                states,
+                first_free,
+                reserved,
+                allocated,
+                free,
+                peak_allocated: allocated,
+            })),
+        }
+    }
+
     fn new(states: [FrameState; N]) -> Self {
         let layout = Layout::from_size_align(N * PAGE_SIZE, PAGE_SIZE).unwrap();
         let backing = NonNull::new(unsafe { alloc(layout) }).expect("fixture backing allocation");
         let mut states = Box::new(states);
-        let allocator = FirstFitFrameAllocator::new();
         let base = kernel_virt_to_phys(VirtualAddress::new(backing.as_ptr() as usize));
         // SAFETY: the fixture owns stable backing and metadata allocations. All
         // returned frames are released before fixture teardown, and metadata
         // outlives the allocator field.
-        unsafe {
-            allocator
-                .init(
-                    base,
-                    PAGE_SIZE,
-                    &mut *(&mut *states as *mut [FrameState; N]),
-                )
-                .unwrap();
-        }
+        let allocator =
+            unsafe { Self::allocator(base, &mut *(&mut *states as *mut [FrameState; N])) };
         Self {
             allocator,
             _states: states,
@@ -76,18 +96,10 @@ impl<const N: usize> Fixture<N> {
         let skip = usize::from((physical.into_raw() & (4 * PAGE_SIZE - 1)) == 0);
         let managed_base = PhysicalAddress::new(physical.into_raw() + skip * PAGE_SIZE);
         let mut states = Box::new(states);
-        let allocator = FirstFitFrameAllocator::new();
         // SAFETY: the N-page managed window lies inside this fixture's N+1
         // backing pages, with the same lifetime guarantees as `new`.
-        unsafe {
-            allocator
-                .init(
-                    managed_base,
-                    PAGE_SIZE,
-                    &mut *(&mut *states as *mut [FrameState; N]),
-                )
-                .unwrap();
-        }
+        let allocator =
+            unsafe { Self::allocator(managed_base, &mut *(&mut *states as *mut [FrameState; N])) };
         Self {
             allocator,
             _states: states,
@@ -247,32 +259,9 @@ fn frame_statistics_track_initial_allocations_and_empty_free_runs() {
     assert_eq!(allocator.largest_free_run(), Some(1));
 }
 
-#[test]
-fn frame_regions_reserve_partial_pages_and_holes() {
-    let base = 0x10000;
-    let region = |start, size, reserved| MemoryRegion {
-        base: PhysicalAddress::new(start),
-        size,
-        is_reserved: reserved,
-        flags: MemFlags::READ | MemFlags::WRITE,
-        memory_type: MemType::Normal(CachePolicy::WriteBack),
-        name: "test",
-    };
-    // Available regions have already been split around reservations.
-    let regions = [
-        region(base + 2 * PAGE_SIZE + 1, PAGE_SIZE, true),
-        region(base + 17, 2 * PAGE_SIZE - 16, false),
-        region(base + 3 * PAGE_SIZE + 1, 3 * PAGE_SIZE - 12, false),
-        region(base + 7 * PAGE_SIZE, PAGE_SIZE, false),
-    ];
-    let mut states = [FrameState::Free; 8];
-    init_frame_states(PhysicalAddress::new(base), PAGE_SIZE, &mut states, &regions).unwrap();
-    use FrameState::{Free as F, Reserved as R};
-    assert_eq!(states, [R, F, R, R, F, R, R, F]);
-}
-
-#[test]
-fn memory_bank_regions_exclude_image_mmio_and_bank_gaps() {
+// Region generation uses a fixed-capacity list larger than the default
+// test thread's stack, so run these checks on a dedicated stack.
+fn with_region_stack(check: impl FnOnce() + Send + 'static) {
     use crate::{
         sync::ConstBarrier,
         thread::{Builder, Entry, Stack},
@@ -280,8 +269,52 @@ fn memory_bank_regions_exclude_image_mmio_and_bank_gaps() {
     };
     let done = Arc::new(ConstBarrier::<2>::new());
     let worker_done = done.clone();
-    // The boot-time region list exceeds the default test thread's stack.
     let _worker = Builder::new(Entry::Closure(Box::new(move || {
+        check();
+        worker_done.wait();
+    })))
+    .set_stack(Stack::from_size(32 * 1024).unwrap())
+    .start();
+    done.wait();
+}
+
+#[test]
+fn boot_frame_states_match_disjoint_memory_regions() {
+    with_region_stack(|| {
+        use crate::mm::memory_bank::create_memory_region_from_memory_bank;
+        let regions = create_memory_region_from_memory_bank(crate::boards::MEMORY_BANKS);
+        let state = FirstFitFrameAllocator::instance().state.irqsave_lock();
+        let state = state
+            .as_ref()
+            .expect("boot initialized the frame allocator");
+        assert_eq!(state.base, crate::boards::PHYS_DRAM_BASE as usize);
+        assert_eq!(state.page_size, PAGE_SIZE);
+        assert_eq!(
+            state.states.len(),
+            crate::boards::PHYS_DRAM_SIZE as usize / PAGE_SIZE
+        );
+        for (index, frame_state) in state.states.iter().enumerate() {
+            let frame = state.base + index * PAGE_SIZE;
+            let available = regions.iter().any(|region| {
+                !region.is_reserved
+                    && frame >= region.base.into_raw()
+                    && frame + PAGE_SIZE <= region.base.into_raw() + region.size
+            });
+            // Available RAM may already back live allocations. Image, device
+            // and undescribed pages must still be reserved.
+            assert_eq!(
+                *frame_state == FrameState::Reserved,
+                !available,
+                "unexpected reservation for physical frame {:#x}",
+                frame,
+            );
+        }
+    });
+}
+
+#[test]
+fn memory_bank_regions_exclude_image_mmio_and_bank_gaps() {
+    with_region_stack(|| {
         use crate::mm::memory_bank::{create_memory_region_from_memory_bank, MemoryBank};
         let start = crate::boards::PHYS_DRAM_BASE as usize;
         let end = start + crate::boards::PHYS_DRAM_SIZE as usize;
@@ -328,24 +361,18 @@ fn memory_bank_regions_exclude_image_mmio_and_bank_gaps() {
                 assert_eq!(region.flags, MemFlags::READ | MemFlags::WRITE);
             }
         }
-        let mut image_states = [FrameState::Free; 1];
-        init_frame_states(text.base, PAGE_SIZE, &mut image_states, &regions).unwrap();
-        assert_eq!(image_states, [FrameState::Reserved]);
-        let mut tail_states = [FrameState::Free; 8];
-        init_frame_states(
-            PhysicalAddress::new(end - 8 * PAGE_SIZE),
-            PAGE_SIZE,
-            &mut tail_states,
-            &regions,
-        )
-        .unwrap();
-        use FrameState::{Free as F, Reserved as R};
-        assert_eq!(tail_states, [F, F, F, F, R, R, F, R]);
-        worker_done.wait();
-    })))
-    .set_stack(Stack::from_size(32 * 1024).unwrap())
-    .start();
-    done.wait();
+        let tail = end - 8 * PAGE_SIZE;
+        for (index, expected_reserved) in [false, false, false, false, true, true, false, true]
+            .into_iter()
+            .enumerate()
+        {
+            let frame = tail + index * PAGE_SIZE;
+            let region = regions.iter().find(|region| {
+                frame >= region.base.into_raw() && frame < region.base.into_raw() + region.size
+            });
+            assert_eq!(region.map_or(true, |r| r.is_reserved), expected_reserved);
+        }
+    });
 }
 
 #[test]
