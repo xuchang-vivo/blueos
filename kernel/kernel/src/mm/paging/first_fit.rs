@@ -372,7 +372,7 @@ unsafe impl FrameAllocator for &FirstFitFrameAllocator {
         FirstFitFrameAllocator::alloc_frame(self)
     }
 
-    unsafe fn free_frame(&mut self, frame: PhysicalAddress) -> Result<(), FrameDeallocationError> {
+    fn free_frame(&mut self, frame: PhysicalAddress) -> Result<(), FrameDeallocationError> {
         unsafe { FirstFitFrameAllocator::free_frame(self, frame) }
     }
 

@@ -180,7 +180,7 @@ pub unsafe trait FrameAllocator {
     /// # Safety
     /// The caller must own this live allocation, with no remaining users or
     /// hardware translations, and must release it exactly once.
-    unsafe fn free_frame(&mut self, frame: PhysicalAddress) -> Result<(), FrameDeallocationError>;
+    fn free_frame(&mut self, frame: PhysicalAddress) -> Result<(), FrameDeallocationError>;
 
     fn usage(&self) -> FrameUsage;
 }
