@@ -255,18 +255,97 @@ fn frame_regions_reserve_partial_pages_and_holes() {
         size,
         is_reserved: reserved,
         flags: MemFlags::READ | MemFlags::WRITE,
+        memory_type: MemType::Normal(CachePolicy::WriteBack),
         name: "test",
     };
-    // Put reservations before RAM to verify precedence does not depend on order.
+    // Available regions have already been split around reservations.
     let regions = [
         region(base + 2 * PAGE_SIZE + 1, PAGE_SIZE, true),
-        region(base + 17, 6 * PAGE_SIZE - 28, false),
+        region(base + 17, 2 * PAGE_SIZE - 16, false),
+        region(base + 3 * PAGE_SIZE + 1, 3 * PAGE_SIZE - 12, false),
         region(base + 7 * PAGE_SIZE, PAGE_SIZE, false),
     ];
     let mut states = [FrameState::Free; 8];
     init_frame_states(PhysicalAddress::new(base), PAGE_SIZE, &mut states, &regions).unwrap();
     use FrameState::{Free as F, Reserved as R};
     assert_eq!(states, [R, F, R, R, F, R, R, F]);
+}
+
+#[test]
+fn memory_bank_regions_exclude_image_mmio_and_bank_gaps() {
+    use crate::{
+        sync::ConstBarrier,
+        thread::{Builder, Entry, Stack},
+        types::Arc,
+    };
+    let done = Arc::new(ConstBarrier::<2>::new());
+    let worker_done = done.clone();
+    // The boot-time region list exceeds the default test thread's stack.
+    let _worker = Builder::new(Entry::Closure(Box::new(move || {
+        use crate::mm::memory_bank::{create_memory_region_from_memory_bank, MemoryBank};
+        let start = crate::boards::PHYS_DRAM_BASE as usize;
+        let end = start + crate::boards::PHYS_DRAM_SIZE as usize;
+        let banks = [
+            // Put MMIO before RAM to check that bank order does not affect splitting.
+            MemoryBank::MMIO((
+                PhysicalAddress::new(end - PAGE_SIZE),
+                PhysicalAddress::new(end),
+            )),
+            MemoryBank::MMIO((PhysicalAddress::new(0), PhysicalAddress::new(PAGE_SIZE))),
+            MemoryBank::RAM((
+                PhysicalAddress::new(end - 2 * PAGE_SIZE),
+                PhysicalAddress::new(end),
+            )),
+            MemoryBank::RAM((
+                PhysicalAddress::new(start),
+                PhysicalAddress::new(end - 4 * PAGE_SIZE),
+            )),
+        ];
+        let regions = create_memory_region_from_memory_bank(&banks);
+        assert!(regions
+            .windows(2)
+            .all(|pair| { pair[0].base.into_raw() + pair[0].size <= pair[1].base.into_raw() }));
+        // Every byte of RAM is described once, except the MMIO outside RAM.
+        assert_eq!(
+            regions.iter().map(|region| region.size).sum::<usize>(),
+            end - start - 2 * PAGE_SIZE + PAGE_SIZE
+        );
+        let text = regions
+            .iter()
+            .find(|region| region.name == ".text")
+            .unwrap();
+        assert!(text.is_reserved);
+        assert_eq!(text.flags, MemFlags::READ | MemFlags::EXECUTE);
+        let rodata = regions
+            .iter()
+            .find(|region| region.name == ".rodata")
+            .unwrap();
+        assert!(rodata.is_reserved);
+        assert_eq!(rodata.flags, MemFlags::READ);
+        for region in &regions {
+            if region.memory_type == MemType::Device {
+                assert!(region.is_reserved);
+                assert_eq!(region.flags, MemFlags::READ | MemFlags::WRITE);
+            }
+        }
+        let mut image_states = [FrameState::Free; 1];
+        init_frame_states(text.base, PAGE_SIZE, &mut image_states, &regions).unwrap();
+        assert_eq!(image_states, [FrameState::Reserved]);
+        let mut tail_states = [FrameState::Free; 8];
+        init_frame_states(
+            PhysicalAddress::new(end - 8 * PAGE_SIZE),
+            PAGE_SIZE,
+            &mut tail_states,
+            &regions,
+        )
+        .unwrap();
+        use FrameState::{Free as F, Reserved as R};
+        assert_eq!(tail_states, [F, F, F, F, R, R, F, R]);
+        worker_done.wait();
+    })))
+    .set_stack(Stack::from_size(32 * 1024).unwrap())
+    .start();
+    done.wait();
 }
 
 #[test]
@@ -531,12 +610,13 @@ fn frame_concurrent_allocations_remain_exclusive_across_yields() {
 
 #[test]
 fn carve_ram_holes_excludes_reserved_and_aligns() {
-    use crate::mm::kernel_space::carve_ram_holes;
+    use crate::mm::memory_bank::carve_ram_holes;
     let region = |base: usize, size: usize, reserved: bool| MemoryRegion {
         base: PhysicalAddress::new(base),
         size,
         is_reserved: reserved,
         flags: MemFlags::READ | MemFlags::WRITE,
+        memory_type: MemType::Normal(CachePolicy::WriteBack),
         name: "test",
     };
     let ram = region(0x1000_0000, 0x4_0000, false);
@@ -556,12 +636,13 @@ fn carve_ram_holes_excludes_reserved_and_aligns() {
 
 #[test]
 fn carve_ram_holes_rejects_non_page_aligned() {
-    use crate::mm::kernel_space::carve_ram_holes;
+    use crate::mm::memory_bank::carve_ram_holes;
     let region = |base: usize, size: usize, reserved: bool| MemoryRegion {
         base: PhysicalAddress::new(base),
         size,
         is_reserved: reserved,
         flags: MemFlags::READ | MemFlags::WRITE,
+        memory_type: MemType::Normal(CachePolicy::WriteBack),
         name: "test",
     };
     let ram = region(0x2000_0000, 4 * PAGE_SIZE, false);
@@ -573,15 +654,15 @@ fn carve_ram_holes_rejects_non_page_aligned() {
     assert!(carve_ram_holes(&ram, aligned.iter()).is_ok());
 }
 
-
 #[test]
 fn carve_ram_holes_full_overlap() {
-    use crate::mm::kernel_space::carve_ram_holes;
+    use crate::mm::memory_bank::carve_ram_holes;
     let region = |base: usize, size: usize, reserved: bool| MemoryRegion {
         base: PhysicalAddress::new(base),
         size,
         is_reserved: reserved,
         flags: MemFlags::READ | MemFlags::WRITE,
+        memory_type: MemType::Normal(CachePolicy::WriteBack),
         name: "test",
     };
     let ram = region(0x4000_0000, 2 * PAGE_SIZE, false);
@@ -592,36 +673,47 @@ fn carve_ram_holes_full_overlap() {
 
 #[test]
 fn carve_ram_holes_partial_prefix() {
-    use crate::mm::kernel_space::carve_ram_holes;
+    use crate::mm::memory_bank::carve_ram_holes;
     let region = |base: usize, size: usize, reserved: bool| MemoryRegion {
         base: PhysicalAddress::new(base),
         size,
         is_reserved: reserved,
         flags: MemFlags::READ | MemFlags::WRITE,
+        memory_type: MemType::Normal(CachePolicy::WriteBack),
         name: "test",
     };
     let ram = region(0x5000_0000, 3 * PAGE_SIZE, false);
     let reserved = [region(0x5000_0000, PAGE_SIZE, true)];
     let holes = carve_ram_holes(&ram, reserved.iter()).unwrap();
-    assert_eq!(holes.as_slice(), [(PhysicalAddress::new(0x5000_1000), 2 * PAGE_SIZE)]);
+    assert_eq!(
+        holes.as_slice(),
+        [(PhysicalAddress::new(0x5000_1000), 2 * PAGE_SIZE)]
+    );
 }
 
 #[test]
 fn carve_ram_holes_multiple_reserved() {
-    use crate::mm::kernel_space::carve_ram_holes;
+    use crate::mm::memory_bank::carve_ram_holes;
     let region = |base: usize, size: usize, reserved: bool| MemoryRegion {
         base: PhysicalAddress::new(base),
         size,
         is_reserved: reserved,
         flags: MemFlags::READ | MemFlags::WRITE,
+        memory_type: MemType::Normal(CachePolicy::WriteBack),
         name: "test",
     };
     let ram = region(0x6000_0000, 5 * PAGE_SIZE, false);
-    let reserved = [region(0x6000_1000, PAGE_SIZE, true), region(0x6000_3000, PAGE_SIZE, true)];
+    let reserved = [
+        region(0x6000_1000, PAGE_SIZE, true),
+        region(0x6000_3000, PAGE_SIZE, true),
+    ];
     let holes = carve_ram_holes(&ram, reserved.iter()).unwrap();
-    assert_eq!(holes.as_slice(), [
-        (PhysicalAddress::new(0x6000_0000), PAGE_SIZE),
-        (PhysicalAddress::new(0x6000_2000), PAGE_SIZE),
-        (PhysicalAddress::new(0x6000_4000), PAGE_SIZE),
-    ]);
+    assert_eq!(
+        holes.as_slice(),
+        [
+            (PhysicalAddress::new(0x6000_0000), PAGE_SIZE),
+            (PhysicalAddress::new(0x6000_2000), PAGE_SIZE),
+            (PhysicalAddress::new(0x6000_4000), PAGE_SIZE),
+        ]
+    );
 }

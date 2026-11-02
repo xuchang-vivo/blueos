@@ -17,18 +17,14 @@
 use super::{
     address_space::Vma,
     kernel_phys_to_virt,
-    memory_bank::{MemoryBank, MemoryRegion},
-    paging::{first_fit::FirstFitFrameAllocator, mapper::PageMapper, PageFormat},
-    CachePolicy, MemAttribute, MemFlags, MemType, PhysicalAddress,
+    memory_bank::MemoryRegion,
+    paging::{first_fit::FirstFitFrameAllocator, mapper::PageMapper},
+    MemAttribute, MemFlags, MemType, PhysicalAddress,
 };
 use crate::arch::page::PageEntry;
-use heapless::Vec;
 use spin::Once;
 
-const PAGE_SIZE: usize = <PageEntry as PageFormat>::PAGE_SIZE;
-
-// Up to six image sections plus one boot-data region per RAM bank, the free
-// segments carved out of every RAM bank, and one region per board bank.
+// Disjoint image, boot-data, available RAM and MMIO regions prepared at boot.
 const REGION_COUNT: usize = 12 + 4 * crate::boards::MEMORY_BANKS.len();
 
 static KERNEL_SPACE: Once<KernelAddressSpace> = Once::new();
@@ -128,32 +124,6 @@ impl KernelAddressSpace {
     }
 
     fn bootstrap(regions: &[MemoryRegion]) -> Result<Self, &'static str> {
-        let mut reserved: Vec<&MemoryRegion, 16> = Vec::new();
-        for region in regions {
-            if region.is_reserved {
-                reserved
-                    .push(region)
-                    .map_err(|_| "too many reserved regions")?;
-            }
-        }
-        for region in &reserved {
-            let end = region
-                .base
-                .into_raw()
-                .checked_add(region.size)
-                .ok_or("reserved region overflow")?;
-            if region.base.into_raw() % PAGE_SIZE != 0 || end % PAGE_SIZE != 0 {
-                return Err("reserved region boundaries must be page aligned");
-            }
-            let inside = regions.iter().any(|ram| {
-                !ram.is_reserved
-                    && region.base.into_raw() >= ram.base.into_raw()
-                    && end <= ram.base.into_raw().saturating_add(ram.size)
-            });
-            if region.size > 0 && !inside {
-                return Err("reserved region lies outside every RAM bank");
-            }
-        }
         let allocator = FirstFitFrameAllocator::instance();
         // SAFETY: boot initialized the physical allocator and the boot direct
         // map. New table frames are disjoint from the reserved kernel image,
@@ -163,32 +133,18 @@ impl KernelAddressSpace {
             regions: [None; REGION_COUNT],
             mapper,
         };
-        let normal = MemType::Normal(CachePolicy::WriteBack);
-        // Reserved regions take precedence: they are mapped with their own
-        // flags before the remaining RAM is handed to the linear map.
-        for region in &reserved {
+        for region in regions {
+            let end = region
+                .base
+                .into_raw()
+                .checked_add(region.size)
+                .ok_or("kernel region overflow")?;
             space.map_linear(
                 region.base,
-                PhysicalAddress::new(region.base.into_raw() + region.size),
+                PhysicalAddress::new(end),
                 region.flags,
-                normal,
+                region.memory_type,
             )?;
-        }
-        for ram in regions.iter().filter(|region| !region.is_reserved) {
-            for (base, size) in carve_ram_holes(ram, reserved.iter().copied())? {
-                space.map_linear(
-                    base,
-                    PhysicalAddress::new(base.into_raw() + size),
-                    MemFlags::READ | MemFlags::WRITE,
-                    normal,
-                )?;
-            }
-        }
-        for bank in crate::boards::MEMORY_BANKS {
-            let MemoryBank::MMIO((start, end)) = bank else {
-                continue;
-            };
-            space.map_linear(*start, *end, MemFlags::READ | MemFlags::WRITE, MemType::Device)?;
         }
         // SAFETY: these tables cover the kernel and direct-mapped RAM. Static
         // region metadata and page tables were constructed without heap use.
@@ -196,61 +152,6 @@ impl KernelAddressSpace {
         unsafe { crate::arch::mmu::activate_kernel_table(space.root_address()) };
         Ok(space)
     }
-}
-
-/// Split `ram` into the page-aligned sub-ranges not covered by `reserved`.
-///
-/// Reservations are clipped to the RAM window; every surviving boundary must
-/// stay page aligned so `map_range` accepts the carved segments. The returned
-/// segments are sorted and never overlap a reservation.
-pub(crate) fn carve_ram_holes<'a>(
-    ram: &MemoryRegion,
-    reserved: impl IntoIterator<Item = &'a MemoryRegion>,
-) -> Result<Vec<(PhysicalAddress, usize), 8>, &'static str> {
-    let ram_start = ram.base.into_raw();
-    let ram_end = ram_start.checked_add(ram.size).ok_or("RAM region overflow")?;
-    if ram.size == 0 {
-        return Ok(Vec::new());
-    }
-    if ram_start % PAGE_SIZE != 0 || ram_end % PAGE_SIZE != 0 {
-        return Err("RAM region boundaries must be page aligned");
-    }
-    let mut spans: Vec<(usize, usize), 8> = Vec::new();
-    for region in reserved {
-        let start = region.base.into_raw().max(ram_start);
-        let end = region
-            .base
-            .into_raw()
-            .checked_add(region.size)
-            .ok_or("reserved region overflow")?
-            .min(ram_end);
-        if start >= end {
-            continue;
-        }
-        if start % PAGE_SIZE != 0 || end % PAGE_SIZE != 0 {
-            return Err("reservation boundaries must be page aligned");
-        }
-        spans
-            .push((start, end))
-            .map_err(|_| "too many reservations in one RAM bank")?;
-    }
-    spans.sort_unstable();
-    let mut holes: Vec<(PhysicalAddress, usize), 8> = Vec::new();
-    let mut cursor = ram_start;
-    for (start, end) in spans {
-        if start > cursor {
-            holes
-                .push((PhysicalAddress::new(cursor), start - cursor))
-                .map_err(|_| "too many free segments in one RAM bank")?;
-        }
-        cursor = cursor.max(end);
-    }
-    if cursor < ram_end {
-        holes
-            .push((PhysicalAddress::new(cursor), ram_end - cursor))
-            .map_err(|_| "too many free segments in one RAM bank")?;
-    }
-    Ok(holes)
 }
 
 pub(crate) fn init_kernel_space(regions: &[MemoryRegion]) -> Result<(), &'static str> {
