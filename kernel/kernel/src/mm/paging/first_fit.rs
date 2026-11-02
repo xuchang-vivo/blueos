@@ -21,9 +21,15 @@
 
 use super::{FrameAllocator, FrameDeallocationError, FrameStats, FrameUsage};
 use crate::{
-    mm::{kernel_phys_to_virt, memory_bank::MemoryRegion, PhysicalAddress},
+    mm::{kernel_phys_to_virt, memory_bank::MemoryRegion, paging::PageFormat, PhysicalAddress},
     sync::SpinLock,
 };
+use core::ptr::addr_of_mut;
+
+const PHYS_BASE: usize = crate::boards::PHYS_DRAM_BASE as usize;
+const PAGE_SIZE: usize = <crate::arch::page::PageEntry as PageFormat>::PAGE_SIZE;
+const FRAME_COUNT: usize = crate::boards::PHYS_DRAM_SIZE as usize / PAGE_SIZE;
+static mut STATES: [FrameState; FRAME_COUNT] = [FrameState::Free; FRAME_COUNT];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -31,38 +37,6 @@ pub enum FrameState {
     Free,
     Reserved,
     Allocated,
-}
-
-/// Initialize frame states from disjoint physical memory regions.
-/// Only complete pages of available RAM become free. Reservations and gaps
-/// outside the described RAM remain reserved.
-pub fn init_frame_states(
-    base: PhysicalAddress,
-    page_size: usize,
-    states: &mut [FrameState],
-    regions: &[MemoryRegion],
-) -> Option<()> {
-    let base = base.into_raw();
-    if !page_size.is_power_of_two() || base & (page_size - 1) != 0 {
-        return None;
-    }
-    let end = base.checked_add(states.len().checked_mul(page_size)?)?;
-    states.fill(FrameState::Reserved);
-    for region in regions.iter().filter(|r| !r.is_reserved) {
-        let start = region.base.into_raw();
-        let region_end = start.checked_add(region.size)?;
-        let start = start.max(base);
-        let region_end = region_end.min(end);
-        if start >= region_end {
-            continue;
-        }
-        let first = (start - base).div_ceil(page_size);
-        let last = (region_end - base) / page_size;
-        if first < last {
-            states[first..last].fill(FrameState::Free);
-        }
-    }
-    Some(())
 }
 
 struct AllocatorState {
@@ -109,18 +83,33 @@ impl FirstFitFrameAllocator {
     /// must not overlap any live objects, including the allocator itself.
     /// Every free page must be writable through the kernel direct map. The RAM
     /// must remain valid for the lifetime of all returned frames.
-    pub unsafe fn init<const N: usize>(
-        &self,
-        base: PhysicalAddress,
-        page_size: usize,
-        states: &'static mut [FrameState; N],
-    ) -> Option<()> {
-        let base = base.into_raw();
+    pub unsafe fn init(&self, regions: &[MemoryRegion]) -> Option<()> {
+        let states = &mut *addr_of_mut!(STATES);
+        let page_size = PAGE_SIZE;
+        let base = PHYS_BASE;
+
         if !page_size.is_power_of_two() || base & (page_size - 1) != 0 {
             return None;
         }
-        let size = N.checked_mul(page_size)?;
-        base.checked_add(size)?;
+        let size = states.len().checked_mul(page_size)?;
+        let end = base.checked_add(size)?;
+        states.fill(FrameState::Reserved);
+        // init framestate array
+        for region in regions.iter().filter(|r| !r.is_reserved) {
+            let start = region.base.into_raw();
+            let region_end = start.checked_add(region.size)?;
+            let start = start.max(base);
+            let region_end = region_end.min(end);
+            if start >= region_end {
+                continue;
+            }
+            let first = (start - base).div_ceil(page_size);
+            let last = (region_end - base) / page_size;
+            if first < last {
+                states[first..last].fill(FrameState::Free);
+            }
+        }
+
         let mut state = self.state.irqsave_lock();
         if state.is_some() {
             return None;

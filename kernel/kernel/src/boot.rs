@@ -232,27 +232,14 @@ fn init_apps() {
 #[inline(never)]
 #[cfg(all(paging, not(allocator_buddy)))]
 pub(crate) fn init_frames(regions: &[crate::mm::memory_bank::MemoryRegion]) {
-    use crate::mm::{
-        paging::{
-            first_fit::{init_frame_states, FirstFitFrameAllocator, FrameState},
-            PageFormat,
-        },
-        PhysicalAddress,
-    };
+    use crate::mm::paging::first_fit::FirstFitFrameAllocator;
 
-    const PAGE_SIZE: usize = <crate::arch::page::PageEntry as PageFormat>::PAGE_SIZE;
-    const PHYS_BASE: usize = crate::boards::PHYS_DRAM_BASE as usize;
-    const FRAME_COUNT: usize = crate::boards::PHYS_DRAM_SIZE as usize / PAGE_SIZE;
-    static mut STATES: [FrameState; FRAME_COUNT] = [FrameState::Free; FRAME_COUNT];
     // SAFETY: CPU0 calls this once after runtime initialization. The static
     // array is exclusively transferred to FirstFit. The reserved regions cover
     // this array, the kernel, stacks and boot table; heap backing follows later.
     unsafe {
-        let states = &mut *addr_of_mut!(STATES);
-        init_frame_states(PhysicalAddress::new(PHYS_BASE), PAGE_SIZE, states, &regions)
-            .expect("invalid physical memory regions");
         FirstFitFrameAllocator::instance()
-            .init(PhysicalAddress::new(PHYS_BASE), PAGE_SIZE, states)
+            .init(&regions)
             .expect("failed to initialize FirstFit frame allocator");
     }
 }
