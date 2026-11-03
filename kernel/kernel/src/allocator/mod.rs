@@ -33,7 +33,7 @@ use core::{alloc::GlobalAlloc, ptr};
 // This module only contains SpinLock wrappers and the GlobalAlloc impl.
 
 #[cfg(paging)]
-mod page_heap;
+pub(crate) mod page_heap;
 #[cfg(paging)]
 pub use allocator_crate::page_heap::{HeapError, HeapStats};
 #[cfg(allocator = "page_heap")]
@@ -238,16 +238,12 @@ pub fn init_heap(start: *mut u8, end: *mut u8) {
 /// Initialize the demand-backed heap after the permanent kernel table is published.
 #[cfg(paging)]
 pub(crate) fn init_paged_heap() -> Result<(), HeapError> {
-    use allocator_crate::page_heap::{PageOwner, PageWindow, PAGE_SIZE};
-    const N: usize = crate::boards::PHYS_DRAM_SIZE as usize / PAGE_SIZE;
-    static mut OWNERS: [PageOwner; N] = [PageOwner::EMPTY; N];
-    let base = kernel_phys_to_virt(PhysicalAddress::new(crate::boards::PHYS_DRAM_BASE as usize))
-        .into_raw();
-    let base = core::ptr::NonNull::new(base as *mut u8).ok_or(HeapError::InvalidGeometry)?;
-    // SAFETY: CPU0 calls once after installing the RAM direct map. OWNERS is
-    // static kernel metadata covered by the frame allocator's reserved region.
-    let window = unsafe { PageWindow::new(base, N) }?;
-    unsafe { HEAP.init(window, &mut *core::ptr::addr_of_mut!(OWNERS)) }
+    use crate::mm::kernel_space::{HEAP_END, HEAP_START};
+    use allocator_crate::page_heap::{PageWindow, PAGE_SIZE};
+    let base = core::ptr::NonNull::new(HEAP_START as *mut u8).ok_or(HeapError::InvalidGeometry)?;
+    // SAFETY: the source reserves and maps each committed span before publication.
+    let window = unsafe { PageWindow::new(base, (HEAP_END - HEAP_START) / PAGE_SIZE) }?;
+    unsafe { HEAP.init(window) }
 }
 
 #[cfg(paging)]

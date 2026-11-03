@@ -12,101 +12,187 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::HeapError;
-use core::alloc::Layout;
+//! Interval ownership and gap queries over Infra's intrusive AVL tree.
+use super::{ClassId, HeapError, PageSpan, PAGE_SIZE};
+use blueos_infra::{
+    avl::{AvlLink, AvlTree},
+    intrusive::Adapter,
+};
+use core::{
+    alloc::Layout,
+    cell::UnsafeCell,
+    cmp::Ordering,
+    mem::{offset_of, size_of},
+    ops::ControlFlow,
+    ptr::NonNull,
+};
 
-// Low two bits are tags. Heads reserve six more bits for log2(alignment).
-const TAG_MASK: usize = 0b11;
-const SLAB: usize = 0b01;
-const LARGE_HEAD: usize = 0b10;
-const LARGE_TAIL: usize = 0b11;
-const ALIGN_BITS: u32 = 6;
-const COUNT_SHIFT: u32 = 2 + ALIGN_BITS;
-const ALIGN_MASK: usize = (1 << ALIGN_BITS) - 1;
-
-#[repr(C)]
 #[derive(Clone, Copy)]
-pub struct PageOwner {
-    words: [usize; 2],
+pub(crate) enum Kind {
+    Empty,
+    Slab(ClassId),
+    Large(Layout),
 }
 
-impl PageOwner {
-    pub const EMPTY: Self = Self { words: [0; 2] };
+struct AreaAdapter<const I: usize>;
+impl<const I: usize> const Adapter<Area> for AreaAdapter<I> {
+    fn offset() -> usize {
+        assert!(I < 2);
+        offset_of!(Area, links) + I * size_of::<AvlLink<Area>>()
+    }
+}
 
-    pub(super) fn is_empty(&self) -> bool {
-        self.words == [0; 2]
-    }
-    pub(super) fn can_encode_pages(pages: usize) -> bool {
-        pages > 0 && pages <= usize::MAX >> COUNT_SHIFT
-    }
-    pub(super) fn can_encode_index(index: usize) -> bool {
-        index <= usize::MAX >> 2
-    }
+/// Stable metadata supplied by a page source, never allocated by the raw heap.
+/// Index 0 belongs to the object heap; index 1 belongs to VA reservations.
+pub struct Area {
+    pub start: usize,
+    pub end: usize,
+    links: [AvlLink<Area>; 2],
+    kind: UnsafeCell<Kind>,
+    payload: UnsafeCell<Option<NonNull<u8>>>,
+}
 
-    pub(super) fn slab(class: super::ClassId) -> Self {
+impl Area {
+    pub fn new(start: usize, pages: usize) -> Result<Self, HeapError> {
+        let end = start
+            .checked_add(
+                pages
+                    .checked_mul(PAGE_SIZE)
+                    .ok_or(HeapError::InvalidGeometry)?,
+            )
+            .ok_or(HeapError::InvalidGeometry)?;
+        if pages == 0 || start & (PAGE_SIZE - 1) != 0 {
+            return Err(HeapError::InvalidGeometry);
+        }
+        Ok(Self {
+            start,
+            end,
+            links: [AvlLink::new(), AvlLink::new()],
+            kind: UnsafeCell::new(Kind::Empty),
+            payload: UnsafeCell::new(None),
+        })
+    }
+    pub(crate) unsafe fn kind(&self) -> Kind {
+        *self.kind.get()
+    }
+    pub(crate) unsafe fn set_kind(&self, kind: Kind) {
+        *self.kind.get() = kind;
+    }
+    /// Whether the object heap has detached this descriptor.
+    ///
+    /// # Safety
+    /// Caller owns the allocation or holds the object index lock.
+    pub unsafe fn detached(&self) -> bool {
+        unsafe { !self.links[0].is_linked() }
+    }
+    pub(crate) unsafe fn attach(&self, start: NonNull<u8>) {
+        *self.payload.get() = Some(start);
+    }
+    pub(crate) unsafe fn span(node: NonNull<Self>) -> PageSpan {
+        let area = node.as_ref();
+        PageSpan {
+            start: (*area.payload.get()).expect("attached payload provenance"),
+            pages: (area.end - area.start) / PAGE_SIZE,
+            area: Some(node),
+        }
+    }
+}
+// Each index and the kind field have a distinct external owner/lock. Ranges
+// stay immutable until both indices have detached the descriptor.
+unsafe impl Send for Area {}
+unsafe impl Sync for Area {}
+
+/// Non-overlapping intervals indexed by start address. Lookup, insertion and
+/// removal are O(log N); gap queries traverse intervals in O(N).
+pub struct AreaIndex<const I: usize> {
+    tree: AvlTree<Area, AreaAdapter<I>>,
+}
+impl<const I: usize> Default for AreaIndex<I> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl<const I: usize> AreaIndex<I> {
+    pub const fn new() -> Self {
+        assert!(I < 2);
         Self {
-            words: [((class.0 as usize) << 2) | SLAB, 0],
+            tree: AvlTree::new(),
         }
     }
 
-    pub(super) fn slab_class(self) -> Result<Option<super::ClassId>, HeapError> {
-        if self.words[0] & TAG_MASK != SLAB {
-            return Ok(None);
+    /// Insert a stable, non-overlapping descriptor without allocating.
+    ///
+    /// # Safety
+    /// Caller keeps nodes and ranges stable until removal, serializes this
+    /// index, and retains backing for every shared reference to a linked node.
+    pub unsafe fn insert(&mut self, node: NonNull<Area>) -> Result<(), HeapError> {
+        let area = node.as_ref();
+        if self.overlaps(area.start, area.end) {
+            return Err(HeapError::Conflict);
         }
-        let index = self.words[0] >> 2;
-        if self.words[1] != 0 || index >= super::CLASS_SIZES.len() {
-            return Err(HeapError::CorruptMetadata);
-        }
-        Ok(Some(super::ClassId(index as u8)))
+        self.tree
+            .insert(node, |a, b| a.start.cmp(&b.start))
+            .map_err(|_| HeapError::Conflict)
     }
 
-    pub(super) fn large_head(pages: usize, layout: Layout) -> Result<Self, HeapError> {
-        let align = layout.align().trailing_zeros();
-        if !Self::can_encode_pages(pages) || align > ALIGN_MASK as u32 || layout.size() == 0 {
-            return Err(HeapError::InvalidRequest);
-        }
-        Ok(Self {
-            words: [
-                (pages << COUNT_SHIFT) | ((align as usize) << 2) | LARGE_HEAD,
-                layout.size(),
-            ],
+    pub fn find(&self, address: usize) -> Option<NonNull<Area>> {
+        self.tree.find(|area| {
+            if address < area.start {
+                Ordering::Less
+            } else if address >= area.end {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            }
         })
     }
-
-    pub(super) fn large_tail(first: usize) -> Result<Self, HeapError> {
-        if !Self::can_encode_index(first) {
-            return Err(HeapError::InvalidRequest);
-        }
-        Ok(Self {
-            words: [(first << 2) | LARGE_TAIL, 0],
-        })
+    pub fn overlaps(&self, start: usize, end: usize) -> bool {
+        self.tree
+            .find(|area| {
+                if end <= area.start {
+                    Ordering::Less
+                } else if start >= area.end {
+                    Ordering::Greater
+                } else {
+                    Ordering::Equal
+                }
+            })
+            .is_some()
+    }
+    pub fn remove(&mut self, start: usize) -> Option<NonNull<Area>> {
+        self.tree.remove(|area| start.cmp(&area.start))
     }
 
-    pub(super) fn head(self) -> Result<(usize, Layout), HeapError> {
-        let pages = self.words[0] >> COUNT_SHIFT;
-        let exponent = (self.words[0] >> 2) & ALIGN_MASK;
-        if self.words[0] & TAG_MASK != LARGE_HEAD || pages == 0 || self.words[1] == 0 {
-            return Err(HeapError::CorruptMetadata);
+    /// Gaps are implicit, so deleting a reservation coalesces space without
+    /// allocating free-area nodes. Traversal uses only the bounded AVL stack.
+    pub fn find_gap(&self, start: usize, end: usize, bytes: usize, align: usize) -> Option<usize> {
+        if bytes == 0 || !align.is_power_of_two() {
+            return None;
         }
-        let align = 1usize
-            .checked_shl(exponent as u32)
-            .ok_or(HeapError::CorruptMetadata)?;
-        let layout = Layout::from_size_align(self.words[1], align)
-            .map_err(|_| HeapError::CorruptMetadata)?;
-        Ok((pages, layout))
+        fn aligned(start: usize, bytes: usize, align: usize, end: usize) -> Option<usize> {
+            let p = start.checked_add(align - 1)? & !(align - 1);
+            (p.checked_add(bytes)? <= end).then_some(p)
+        }
+        let mut cursor = start;
+        match self.tree.try_for_each(|area| {
+            if let Some(p) = aligned(cursor, bytes, align, area.start.min(end)) {
+                return ControlFlow::Break(p);
+            }
+            cursor = cursor.max(area.end);
+            ControlFlow::Continue(())
+        }) {
+            ControlFlow::Break(p) => Some(p),
+            ControlFlow::Continue(()) => aligned(cursor, bytes, align, end),
+        }
     }
-
-    pub(super) fn tail_index(self) -> Result<Option<usize>, HeapError> {
-        if self.words[0] & TAG_MASK != LARGE_TAIL {
-            return Ok(None);
-        }
-        if self.words[1] != 0 {
-            return Err(HeapError::CorruptMetadata);
-        }
-        Ok(Some(self.words[0] >> 2))
-    }
-
-    pub(super) fn same_encoding(self, other: Self) -> bool {
-        self.words == other.words
+    pub fn largest_gap(&self, start: usize, end: usize) -> usize {
+        let mut cursor = start;
+        let mut max = 0;
+        let _completed = self.tree.try_for_each::<(), _>(|area| {
+            max = max.max(area.start.saturating_sub(cursor));
+            cursor = cursor.max(area.end);
+            ControlFlow::Continue(())
+        });
+        max.max(end.saturating_sub(cursor))
     }
 }

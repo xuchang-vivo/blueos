@@ -179,6 +179,147 @@ impl<F: FrameAllocator, P: PageFormat> PageMapper<F, P> {
         Ok(())
     }
 
+    fn existing_slot(&self, va: usize) -> Option<*mut usize> {
+        let mut table = self.root_addr;
+        for level in 0..P::LEVELS - 1 {
+            let slot = Self::entry_ptr(table, va, level).ok()?;
+            table = P::table_address(unsafe { slot.read() })?;
+        }
+        Self::entry_ptr(table, va, P::LEVELS - 1).ok()
+    }
+
+    /// Back an exclusively reserved VA range with individually owned frames.
+    ///
+    /// # Safety
+    /// Caller serializes all walks/updates, owns the VA reservation, and ensures
+    /// the range has no users until success. Failure restores an unmapped range.
+    pub(crate) unsafe fn map_owned_range(
+        &mut self,
+        virt: VirtualAddress,
+        len: usize,
+    ) -> Result<(), &'static str> {
+        let start = virt.into_raw();
+        let end = start.checked_add(len).ok_or("heap mapping overflow")?;
+        if len == 0 || (start | len) & (P::PAGE_SIZE - 1) != 0 {
+            return Err("invalid heap range");
+        }
+        for va in (start..end).step_by(P::PAGE_SIZE) {
+            if self.leaf_entry(va).is_some() {
+                return Err("heap range already mapped");
+            }
+        }
+        let result = (|| {
+            self.prepare_range(virt, len)?;
+            for va in (start..end).step_by(P::PAGE_SIZE) {
+                let frame = self.allocator.alloc_frame().ok_or("out of heap frames")?;
+                let attributes = MemAttribute {
+                    flags: MemFlags::READ | MemFlags::WRITE | MemFlags::GLOBAL,
+                    memory_type: MemType::Normal(crate::mm::CachePolicy::WriteBack),
+                };
+                if let Err(e) =
+                    self.map_range(VirtualAddress::new(va), frame, P::PAGE_SIZE, attributes)
+                {
+                    self.allocator
+                        .free_frame(frame)
+                        .expect("return unpublished frame");
+                    return Err(e);
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.release_owned_range(virt, len);
+        } else {
+            crate::arch::mmu::sync_kernel_mappings();
+        }
+        result
+    }
+
+    /// Revoke an owned range, synchronize CPUs, then release data/table frames.
+    /// Invalid leaf descriptors temporarily retain PFNs as a no-allocation
+    /// retirement ledger; the caller's mapping lock excludes software walkers.
+    ///
+    /// # Safety
+    /// The caller exclusively owns the range and its backing, has stopped all
+    /// users and serializes walks/updates. No unrelated mapping may lie inside.
+    pub(crate) unsafe fn release_owned_range(&mut self, virt: VirtualAddress, len: usize) {
+        let start = virt.into_raw();
+        let end = start.checked_add(len).expect("owned range overflow");
+        for va in (start..end).step_by(P::PAGE_SIZE) {
+            if let Some(slot) = self.existing_slot(va) {
+                let entry = slot.read();
+                if P::is_valid(entry) {
+                    slot.write(entry & !1);
+                }
+            }
+        }
+        crate::arch::mmu::sync_kernel_mappings();
+        for va in (start..end).step_by(P::PAGE_SIZE) {
+            if let Some(slot) = self.existing_slot(va) {
+                let entry = slot.read();
+                if entry & 0b11 == 0b10 {
+                    let frame = P::table_address(entry | 1).expect("retired page descriptor");
+                    slot.write(0);
+                    self.allocator
+                        .free_frame(PhysicalAddress::new(frame))
+                        .expect("release heap backing");
+                }
+            }
+        }
+        // Disconnect empty tables but keep their storage until walk-cache
+        // invalidation completes. The retired page's first word stores a PFN
+        // link with invalid descriptor bits, never a writable live mapping.
+        let mut retired = 0;
+        let span = P::PAGE_SIZE * (P::PAGE_SIZE / size_of::<usize>());
+        let mut va = start;
+        while va < end {
+            self.prune_empty_path(va, &mut retired);
+            va += (span - (va & (span - 1))).min(end - va);
+        }
+        if retired != 0 {
+            crate::arch::mmu::sync_kernel_mappings();
+            while retired != 0 {
+                let frame = retired;
+                retired = (kernel_phys_to_virt(PhysicalAddress::new(frame)).into_raw()
+                    as *const usize)
+                    .read();
+                self.allocator
+                    .free_frame(PhysicalAddress::new(frame))
+                    .expect("release empty heap table");
+            }
+        }
+    }
+
+    unsafe fn prune_empty_path(&mut self, va: usize, retired: &mut usize) {
+        assert!(P::LEVELS <= 4);
+        let mut tables = [0usize; 4];
+        let mut slots = [core::ptr::null_mut::<usize>(); 4];
+        tables[0] = self.root_addr;
+        let mut depth = 0;
+        for level in 0..P::LEVELS - 1 {
+            let slot = Self::entry_ptr(tables[level as usize], va, level).unwrap();
+            let Some(child) = P::table_address(slot.read()) else {
+                break;
+            };
+            slots[level as usize] = slot;
+            tables[level as usize + 1] = child;
+            depth = level as usize + 1;
+        }
+        for level in (1..=depth).rev() {
+            let ptr =
+                kernel_phys_to_virt(PhysicalAddress::new(tables[level])).into_raw() as *mut usize;
+            if core::slice::from_raw_parts(ptr, P::PAGE_SIZE / size_of::<usize>())
+                .iter()
+                .any(|e| *e != 0)
+            {
+                break;
+            }
+            slots[level - 1].write(0);
+            ptr.write(*retired);
+            *retired = tables[level];
+        }
+    }
+
     /// Map an aligned range in an inactive table. Existing mappings are rejected.
     /// On allocation failure, some of the range may already have been mapped;
     /// the caller must discard the table rather than install a partial layout.

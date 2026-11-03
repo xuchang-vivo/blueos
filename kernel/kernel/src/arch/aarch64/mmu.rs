@@ -33,6 +33,20 @@ fn flush_tlb_all() {
     isb(SY);
 }
 
+/// Publish kernel page-table changes and retire translations on every CPU
+/// in the inner-shareable domain before backing/table frames can be reused.
+pub(crate) fn sync_kernel_mappings() {
+    unsafe {
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 pub fn init_el1_enable_mmu() {
     let phys_addr = unsafe { crate::mm::paging::init_boot_pgtable::<super::page::PageEntry>() };
     dsb(SY);

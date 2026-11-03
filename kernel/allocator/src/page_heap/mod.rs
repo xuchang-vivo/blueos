@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Raw metadata core for a heap backed by independently owned physical page runs.
+//! Raw metadata core for a heap backed by owned virtual page ranges.
 //!
 //! The caller acquires pages outside its heap lock and publishes them here. This
 //! module never obtains pages, performs payload initialization, or releases pages.
@@ -21,7 +21,8 @@ mod metadata;
 mod slab;
 
 use core::{alloc::Layout, ptr::NonNull};
-pub use metadata::PageOwner;
+use metadata::Kind;
+pub use metadata::{Area, AreaIndex};
 
 pub const PAGE_SIZE: usize = 4096;
 pub const CLASS_SIZES: [usize; 8] = [8, 16, 32, 64, 128, 256, 512, 1024];
@@ -78,11 +79,19 @@ pub fn classify(layout: Layout) -> Result<AllocationPlan, HeapError> {
     }))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct PageSpan {
     start: NonNull<u8>,
     pages: usize,
+    area: Option<NonNull<Area>>,
 }
+
+impl PartialEq for PageSpan {
+    fn eq(&self, other: &Self) -> bool {
+        self.start == other.start && self.pages == other.pages
+    }
+}
+impl Eq for PageSpan {}
 
 impl PageSpan {
     /// Describes a nonempty, page-aligned run without taking ownership of it.
@@ -92,7 +101,32 @@ impl PageSpan {
     /// in the run. This descriptor does not make the described memory writable.
     pub unsafe fn new(start: NonNull<u8>, pages: usize) -> Result<Self, HeapError> {
         validate_geometry(start, pages)?;
-        Ok(Self { start, pages })
+        Ok(Self {
+            start,
+            pages,
+            area: None,
+        })
+    }
+
+    /// Attach stable metadata exclusively owned by this page allocation.
+    ///
+    /// # Safety
+    /// The area must describe exactly this span and outlive all heap/index uses.
+    /// It must not already belong to an object heap. The source removes its own
+    /// reservation only after the heap has detached the descriptor.
+    pub unsafe fn with_area(mut self, area: NonNull<Area>) -> Result<Self, HeapError> {
+        if area.as_ref().start != self.start.as_ptr().addr()
+            || area.as_ref().end != self.start.as_ptr().addr() + self.byte_len()
+        {
+            return Err(HeapError::InvalidGeometry);
+        }
+        area.as_ref().attach(self.start);
+        self.area = Some(area);
+        Ok(self)
+    }
+
+    pub fn area(self) -> Option<NonNull<Area>> {
+        self.area
     }
 
     pub fn start(self) -> NonNull<u8> {
@@ -225,35 +259,52 @@ pub enum SlabCommit {
     Existing(Allocation),
 }
 
-pub struct PageHeap<'a> {
+pub struct PageHeap {
     window: PageWindow,
-    owners: &'a mut [PageOwner],
+    areas: AreaIndex<0>,
     stats: HeapStats,
     partial: [usize; 8],
 }
 
-impl<'a> PageHeap<'a> {
-    /// Initializes a new ownership table for the address window.
+impl PageHeap {
+    /// Create an empty heap without allocating metadata proportional to VA size.
     ///
     /// # Safety
-    /// No live heap allocations may exist in the window. The caller must keep
-    /// the window's actual owned pages valid until detached, and the ownership
-    /// table must not overlap any page that may be published to this heap.
-    pub unsafe fn new(window: PageWindow, owners: &'a mut [PageOwner]) -> Result<Self, HeapError> {
-        if owners.len() < window.pages
-            || !PageOwner::can_encode_pages(window.pages)
-            || !PageOwner::can_encode_index(window.pages - 1)
-        {
-            return Err(HeapError::InvalidGeometry);
-        }
-        let owners = &mut owners[..window.pages];
-        owners.fill(PageOwner::EMPTY);
+    /// Sources retain writable backing and stable Area metadata for every
+    /// committed span until it is detached by free.
+    pub unsafe fn new(window: PageWindow) -> Result<Self, HeapError> {
         Ok(Self {
             window,
-            owners,
+            areas: AreaIndex::new(),
             stats: HeapStats::default(),
             partial: [usize::MAX; 8],
         })
+    }
+
+    fn candidate(&self, span: PageSpan) -> Result<NonNull<Area>, HeapError> {
+        self.window.index_of(span.start)?;
+        let end = span
+            .start
+            .as_ptr()
+            .addr()
+            .checked_add(span.byte_len())
+            .ok_or(HeapError::OutOfWindow)?;
+        if end > self.window.base.as_ptr().addr() + self.window.pages * PAGE_SIZE {
+            return Err(HeapError::OutOfWindow);
+        }
+        if self.areas.overlaps(span.start.as_ptr().addr(), end) {
+            return Err(HeapError::Conflict);
+        }
+        let area = span.area.ok_or(HeapError::InvalidGeometry)?;
+        unsafe {
+            if area.as_ref().start != span.start.as_ptr().addr()
+                || area.as_ref().end != end
+                || !area.as_ref().detached()
+            {
+                return Err(HeapError::Conflict);
+            }
+        }
+        Ok(area)
     }
 
     pub fn stats(&self) -> HeapStats {
@@ -273,7 +324,7 @@ impl<'a> PageHeap<'a> {
     /// # Safety
     /// The caller exclusively owns all pages in the run and must retain their
     /// ownership after success until this heap returns the run from `free`.
-    /// The run must be physically contiguous and writable for its entire size.
+    /// The run must be virtually contiguous and writable for its entire size.
     pub unsafe fn commit_large(
         &mut self,
         span: PageSpan,
@@ -282,20 +333,13 @@ impl<'a> PageHeap<'a> {
         if span.start.as_ptr().addr() & (PAGE_SIZE - 1) != 0 {
             return Err(HeapError::InvalidGeometry);
         }
-        let first = self.window.index_of(span.start)?;
-        let end = first
-            .checked_add(span.pages)
-            .ok_or(HeapError::OutOfWindow)?;
-        let target = self.owners.get(first..end).ok_or(HeapError::OutOfWindow)?;
-        if !target.iter().all(PageOwner::is_empty) {
-            return Err(HeapError::Conflict);
-        }
-        let head = PageOwner::large_head(span.pages, layout)?;
-        if layout.size() > span.byte_len() || span.start.as_ptr().addr() & (layout.align() - 1) != 0
+        let area = self.candidate(span)?;
+        if layout.size() == 0
+            || layout.size() > span.byte_len()
+            || span.start.as_ptr().addr() & (layout.align() - 1) != 0
         {
             return Err(HeapError::InvalidRequest);
         }
-        let tail = PageOwner::large_tail(first)?;
         let mut stats = self.stats;
         stats.large_pages = stats
             .large_pages
@@ -314,8 +358,8 @@ impl<'a> PageHeap<'a> {
             .checked_add(span.byte_len())
             .ok_or(HeapError::InvalidRequest)?;
         stats.peak_charged_bytes = stats.peak_charged_bytes.max(stats.charged_bytes);
-        self.owners[first] = head;
-        self.owners[first + 1..end].fill(tail);
+        self.areas.insert(area)?;
+        area.as_ref().set_kind(Kind::Large(layout));
         self.stats = stats;
         Ok(Allocation {
             ptr: span.start,
@@ -324,44 +368,20 @@ impl<'a> PageHeap<'a> {
     }
 
     pub fn allocation_info(&self, ptr: NonNull<u8>) -> Result<AllocationInfo, HeapError> {
-        let index = self
-            .window
-            .index_of(ptr)
-            .map_err(|_| HeapError::NotAllocated)?;
-        let owner = self.owners[index];
-        if owner.is_empty() {
-            return Err(HeapError::NotAllocated);
-        }
-        if let Some(class) = owner.slab_class()? {
-            return self.slab_info(index, ptr, class);
-        }
-        let first = match owner.tail_index()? {
-            Some(first) if first < index => first,
-            Some(_) => return Err(HeapError::CorruptMetadata),
-            None => index,
+        let node = self
+            .areas
+            .find(ptr.as_ptr().addr())
+            .ok_or(HeapError::NotAllocated)?;
+        let area = unsafe { node.as_ref() };
+        let kind = unsafe { area.kind() };
+        let span = unsafe { Area::span(node) };
+        let layout = match kind {
+            Kind::Slab(class) => {
+                return self.slab_info(self.window.index_of(span.start)?, ptr, class)
+            }
+            Kind::Large(layout) => layout,
+            Kind::Empty => return Err(HeapError::CorruptMetadata),
         };
-        let (pages, layout) = self
-            .owners
-            .get(first)
-            .ok_or(HeapError::CorruptMetadata)?
-            .head()?;
-        let end = first.checked_add(pages).ok_or(HeapError::CorruptMetadata)?;
-        let chain = self
-            .owners
-            .get(first + 1..end)
-            .ok_or(HeapError::CorruptMetadata)?;
-        let tail = PageOwner::large_tail(first).map_err(|_| HeapError::CorruptMetadata)?;
-        if !chain.iter().all(|owner| owner.same_encoding(tail)) || index >= end {
-            return Err(HeapError::CorruptMetadata);
-        }
-        let span = self
-            .window
-            .span(first, pages)
-            .map_err(|_| HeapError::CorruptMetadata)?;
-        if layout.size() > span.byte_len() || span.start.as_ptr().addr() & (layout.align() - 1) != 0
-        {
-            return Err(HeapError::CorruptMetadata);
-        }
         if ptr != span.start {
             return Err(HeapError::InteriorPointer);
         }
@@ -398,9 +418,8 @@ impl<'a> PageHeap<'a> {
                 return Ok(false);
             }
         } else {
-            let head = PageOwner::large_head(info.span.pages(), new)?;
-            let first = self.window.index_of(info.span.start())?;
-            self.owners[first] = head;
+            let node = info.span.area.ok_or(HeapError::CorruptMetadata)?;
+            node.as_ref().set_kind(Kind::Large(new));
         }
         Ok(true)
     }
@@ -421,7 +440,6 @@ impl<'a> PageHeap<'a> {
         if let AllocationKind::Slab(_) = info.kind {
             return self.free_slab(ptr, info);
         }
-        let first = self.window.index_of(info.span.start)?;
         let mut stats = self.stats;
         stats.large_pages = stats
             .large_pages
@@ -439,7 +457,11 @@ impl<'a> PageHeap<'a> {
             .charged_bytes
             .checked_sub(info.capacity)
             .ok_or(HeapError::CorruptMetadata)?;
-        self.owners[first..first + info.span.pages].fill(PageOwner::EMPTY);
+        let node = self
+            .areas
+            .remove(info.span.start.as_ptr().addr())
+            .ok_or(HeapError::CorruptMetadata)?;
+        node.as_ref().set_kind(Kind::Empty);
         self.stats = stats;
         Ok(ReleaseAction::Pages(info.span))
     }

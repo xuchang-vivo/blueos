@@ -156,7 +156,7 @@ pub fn create_memory_region_from_memory_bank(
             let page_size =
                 <crate::arch::page::PageEntry as crate::mm::paging::PageFormat>::PAGE_SIZE;
             assert!(
-                region.base.into_raw() % page_size == 0 && end % page_size == 0,
+                (region.base.into_raw() | end) & (page_size - 1) == 0,
                 "reserved region boundaries must be page aligned"
             );
         }
@@ -219,7 +219,7 @@ pub(crate) fn carve_ram_holes<'a>(
         return Ok(Vec::new());
     }
     #[cfg(paging)]
-    if ram_start % page_size != 0 || ram_end % page_size != 0 {
+    if (ram_start | ram_end) & (page_size - 1) != 0 {
         return Err("RAM region boundaries must be page aligned");
     }
     let mut spans: Vec<(usize, usize), 8> = Vec::new();
@@ -235,7 +235,7 @@ pub(crate) fn carve_ram_holes<'a>(
             continue;
         }
         #[cfg(paging)]
-        if start % page_size != 0 || end % page_size != 0 {
+        if (start | end) & (page_size - 1) != 0 {
             return Err("reservation boundaries must be page aligned");
         }
         spans

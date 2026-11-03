@@ -19,16 +19,13 @@ use crate::mm::{
     paging::{mapper::PageMapper, FrameDeallocationError, FrameStats, PageFormat},
     CachePolicy, MemAttribute, MemFlags, MemType, PhysicalAddress, VirtualAddress,
 };
-use alloc::{
-    alloc::{alloc, dealloc, Layout},
-    boxed::Box,
-};
+use alloc::{alloc::Layout, boxed::Box};
 use blueos_test_macro::test;
 use core::ptr::NonNull;
 
 const PAGE_SIZE: usize = 4096;
 
-/// Private suballocator over exclusively owned, physically contiguous heap
+/// Private suballocator over exclusively owned, physically contiguous frame
 /// backing. Its state and backing outlive every allocation used by each test.
 #[must_use]
 struct Fixture<const N: usize> {
@@ -72,7 +69,10 @@ impl<const N: usize> Fixture<N> {
 
     fn new(states: [FrameState; N]) -> Self {
         let layout = Layout::from_size_align(N * PAGE_SIZE, PAGE_SIZE).unwrap();
-        let backing = NonNull::new(unsafe { alloc(layout) }).expect("fixture backing allocation");
+        let physical = FirstFitFrameAllocator::instance()
+            .alloc_frames(N)
+            .expect("fixture physical backing");
+        let backing = NonNull::new(kernel_phys_to_virt(physical).into_raw() as *mut u8).unwrap();
         let mut states = Box::new(states);
         let base = kernel_virt_to_phys(VirtualAddress::new(backing.as_ptr() as usize));
         // SAFETY: the fixture owns stable backing and metadata allocations. All
@@ -91,7 +91,10 @@ impl<const N: usize> Fixture<N> {
 
     fn with_misaligned_base(states: [FrameState; N]) -> Self {
         let layout = Layout::from_size_align((N + 1) * PAGE_SIZE, PAGE_SIZE).unwrap();
-        let backing = NonNull::new(unsafe { alloc(layout) }).unwrap();
+        let physical = FirstFitFrameAllocator::instance()
+            .alloc_frames(N + 1)
+            .unwrap();
+        let backing = NonNull::new(kernel_phys_to_virt(physical).into_raw() as *mut u8).unwrap();
         let physical = kernel_virt_to_phys(VirtualAddress::new(backing.as_ptr() as usize));
         let skip = usize::from((physical.into_raw() & (4 * PAGE_SIZE - 1)) == 0);
         let managed_base = PhysicalAddress::new(physical.into_raw() + skip * PAGE_SIZE);
@@ -121,7 +124,14 @@ impl<const N: usize> Fixture<N> {
 impl<const N: usize> Drop for Fixture<N> {
     fn drop(&mut self) {
         // All guards borrow this fixture and have already been dropped.
-        unsafe { dealloc(self.backing.as_ptr(), self.layout) };
+        unsafe {
+            FirstFitFrameAllocator::instance()
+                .free_frames(
+                    kernel_virt_to_phys(VirtualAddress::new(self.backing.as_ptr() as usize)),
+                    self.layout.size() / PAGE_SIZE,
+                )
+                .unwrap();
+        }
     }
 }
 
@@ -370,7 +380,7 @@ fn memory_bank_regions_exclude_image_mmio_and_bank_gaps() {
             let region = regions.iter().find(|region| {
                 frame >= region.base.into_raw() && frame < region.base.into_raw() + region.size
             });
-            assert_eq!(region.map_or(true, |r| r.is_reserved), expected_reserved);
+            assert_eq!(region.is_none_or(|r| r.is_reserved), expected_reserved);
         }
     });
 }
@@ -550,11 +560,14 @@ fn page_table_cleanup_keeps_leaf_backing_owned_by_caller() {
 #[test]
 fn boot_runtime_frames_do_not_overlap_live_heap_buffers() {
     let buffer = alloc::vec![0xa5u8; 2 * PAGE_SIZE];
-    let start = kernel_virt_to_phys(VirtualAddress::new(buffer.as_ptr() as usize)).into_raw();
     let page = FirstFitFrameAllocator::instance()
         .alloc_zeroed_frame()
         .unwrap();
-    assert!(page.address().into_raw() < start || page.address().into_raw() >= start + buffer.len());
+    for offset in (0..buffer.len()).step_by(PAGE_SIZE) {
+        let physical =
+            kernel_virt_to_phys(VirtualAddress::new(buffer.as_ptr() as usize + offset)).into_raw();
+        assert_ne!(page.address().into_raw(), physical);
+    }
     assert!(buffer.iter().all(|byte| *byte == 0xa5));
 }
 
@@ -743,4 +756,62 @@ fn carve_ram_holes_multiple_reserved() {
             (PhysicalAddress::new(0x6000_4000), PAGE_SIZE),
         ]
     );
+}
+
+#[test]
+fn owned_virtual_range_uses_scattered_frames_and_reclaims_tables() {
+    use FrameState::{Free as F, Reserved as R};
+    let count = crate::arch::page::PageEntry::LEVELS as usize + 3;
+    let mut states = [R; 14];
+    for i in 0..count {
+        states[2 * i] = F;
+    }
+    let fixture = Fixture::new(states);
+    let allocator = &fixture.allocator;
+    let mut mapper = unsafe { PageMapper::<_>::create(allocator) }.unwrap();
+    let before = allocator.frame_stats().unwrap();
+    let va = VirtualAddress::new(0x1000);
+    unsafe { mapper.map_owned_range(va, 3 * PAGE_SIZE) }.unwrap();
+    let mut previous = None;
+    for index in 0..3 {
+        let physical = mapper.translate(va.into_raw() + index * PAGE_SIZE).unwrap();
+        if let Some(last) = previous {
+            assert_eq!(physical.into_raw(), last + 2 * PAGE_SIZE);
+        }
+        previous = Some(physical.into_raw());
+        let ptr = kernel_phys_to_virt(physical).into_raw() as *mut u8;
+        unsafe { ptr.write_bytes(index as u8, PAGE_SIZE) };
+    }
+    assert_eq!(allocator.frame_stats().unwrap().free, 0);
+    unsafe { mapper.release_owned_range(va, 3 * PAGE_SIZE) };
+    assert!(mapper.translate(va.into_raw()).is_none());
+    let after = allocator.frame_stats().unwrap();
+    assert_eq!(
+        (after.free, after.allocated),
+        (before.free, before.allocated)
+    );
+    drop(mapper);
+    assert_eq!(allocator.frame_stats().unwrap().free, count);
+}
+
+#[test]
+fn owned_mapping_oom_rolls_back_partial_tables_and_backing() {
+    for free in 1..crate::arch::page::PageEntry::LEVELS as usize + 3 {
+        let mut states = [FrameState::Reserved; 8];
+        states[..free].fill(FrameState::Free);
+        let fixture = Fixture::new(states);
+        let allocator = &fixture.allocator;
+        let mut mapper = unsafe { PageMapper::<_>::create(allocator) }.unwrap();
+        let before = allocator.frame_stats().unwrap();
+        let va = VirtualAddress::new(0x1000);
+        assert!(unsafe { mapper.map_owned_range(va, 3 * PAGE_SIZE) }.is_err());
+        assert!(mapper.translate(va.into_raw()).is_none());
+        let after = allocator.frame_stats().unwrap();
+        assert_eq!(
+            (after.free, after.allocated),
+            (before.free, before.allocated)
+        );
+        drop(mapper);
+        assert_eq!(allocator.frame_stats().unwrap().free, free);
+    }
 }

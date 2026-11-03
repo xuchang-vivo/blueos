@@ -14,12 +14,12 @@
 
 use super::{
     memory_info_from_frames,
-    source::{FirstFitSource, PageSource, PendingPages},
+    source::{PageSource, PendingPages, VmapSource},
     PageHeap,
 };
 use crate::{mm::paging::FrameStats, sync::SpinLock};
 use alloc::sync::{Arc, Weak};
-use allocator_crate::page_heap::{PageOwner, PageRequest, PageSpan, PageWindow, PAGE_SIZE};
+use allocator_crate::page_heap::{PageRequest, PageSpan, PageWindow, PAGE_SIZE};
 use blueos_test_macro::test;
 use core::{
     alloc::Layout,
@@ -28,7 +28,7 @@ use core::{
 };
 
 struct CountingSource {
-    inner: FirstFitSource,
+    inner: VmapSource,
     fail_next: AtomicBool,
     two_page_slab_next: AtomicBool,
     #[cfg(smp)]
@@ -42,7 +42,7 @@ struct CountingSource {
 impl CountingSource {
     fn new() -> Self {
         Self {
-            inner: FirstFitSource,
+            inner: VmapSource,
             fail_next: AtomicBool::new(false),
             two_page_slab_next: AtomicBool::new(false),
             #[cfg(smp)]
@@ -110,59 +110,27 @@ unsafe impl PageSource for CountingSource {
 }
 
 #[must_use]
-struct TestMetadata {
-    ptr: NonNull<u8>,
-    layout: Layout,
-    pages: usize,
-}
-impl TestMetadata {
-    fn new(pages: usize) -> Self {
-        let layout = Layout::array::<PageOwner>(pages).unwrap();
-        let ptr = NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) }).unwrap();
-        Self { ptr, layout, pages }
-    }
-}
-impl Drop for TestMetadata {
-    fn drop(&mut self) {
-        unsafe { alloc::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
-    }
-}
-
-#[must_use]
 struct KernelFixture {
     heap: Arc<PageHeap<CountingSource>>,
-    metadata: TestMetadata,
 }
 impl KernelFixture {
     fn new() -> Self {
-        let pages = crate::boards::PHYS_DRAM_SIZE as usize / PAGE_SIZE;
-        let metadata = TestMetadata::new(pages);
-        let base = crate::mm::kernel_phys_to_virt(crate::mm::PhysicalAddress::new(
-            crate::boards::PHYS_DRAM_BASE as usize,
-        ))
-        .into_raw();
+        let base = crate::mm::kernel_space::HEAP_START;
+        let pages = (crate::mm::kernel_space::HEAP_END - base) / PAGE_SIZE;
         let window =
             unsafe { PageWindow::new(NonNull::new(base as *mut u8).unwrap(), pages) }.unwrap();
         let heap = Arc::new(PageHeap::with_source(CountingSource::new()));
         *heap.source.probe.irqsave_lock() = Some(Arc::downgrade(&heap));
-        // Fixture owns stable raw metadata storage; heap drops first, no Box retag.
-        let owners: &'static mut [PageOwner] = unsafe {
-            core::slice::from_raw_parts_mut(metadata.ptr.as_ptr().cast(), metadata.pages)
-        };
         unsafe {
-            heap.init(window, owners).unwrap();
+            heap.init(window).unwrap();
         }
-        Self { heap, metadata }
+        Self { heap }
     }
 }
 impl Drop for KernelFixture {
     fn drop(&mut self) {
         assert_eq!(Arc::strong_count(&self.heap), 1);
         assert_eq!(self.heap.source.live_pages.load(Ordering::Acquire), 0);
-        assert_eq!(
-            self.metadata.pages,
-            crate::boards::PHYS_DRAM_SIZE as usize / PAGE_SIZE
-        );
     }
 }
 
@@ -258,10 +226,9 @@ fn private_heap_grows_past_old_fixed_capacity_and_returns_all_pages() {
     }
 }
 
-// Catches satisfying a contiguous request using scattered physical pages or
-// dropping high alignment when obtaining a new run from the frame allocator.
+// Heap alignment is virtual; each backing page is translated independently.
 #[test]
-fn private_heap_allocations_are_physically_contiguous() {
+fn private_heap_allocations_are_virtually_contiguous() {
     use crate::mm::{kernel_virt_to_phys, VirtualAddress};
     let f = KernelFixture::new();
     for size in [1025, 4096, 4097, 65537] {
@@ -269,20 +236,16 @@ fn private_heap_allocations_are_physically_contiguous() {
             let layout = Layout::from_size_align(size, align).unwrap();
             let buffer = f.heap.alloc(layout).unwrap();
             let start = buffer.as_ptr().addr();
-            let physical = kernel_virt_to_phys(VirtualAddress::new(start)).into_raw();
+            assert!(
+                (crate::mm::kernel_space::HEAP_START..crate::mm::kernel_space::HEAP_END)
+                    .contains(&start)
+            );
             assert_eq!(start % align, 0);
-            assert_eq!(physical % align, 0);
             for offset in (0..size).step_by(PAGE_SIZE) {
-                assert_eq!(
-                    kernel_virt_to_phys(VirtualAddress::new(start + offset)).into_raw(),
-                    physical + offset
-                );
+                let physical = kernel_virt_to_phys(VirtualAddress::new(start + offset)).into_raw();
+                assert_eq!(physical % PAGE_SIZE, 0);
                 unsafe { buffer.as_ptr().add(offset).write(0xa5) };
             }
-            assert_eq!(
-                kernel_virt_to_phys(VirtualAddress::new(start + size - 1)).into_raw(),
-                physical + size - 1
-            );
             for offset in (0..size).step_by(PAGE_SIZE) {
                 assert_eq!(unsafe { buffer.as_ptr().add(offset).read() }, 0xa5);
             }

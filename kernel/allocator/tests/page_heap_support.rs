@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use allocator_crate::page_heap::{PageHeap, PageOwner, PageSpan, PageWindow, PAGE_SIZE};
+use allocator_crate::page_heap::{Area, PageHeap, PageSpan, PageWindow, PAGE_SIZE};
 use std::{
     alloc::{alloc_zeroed, dealloc, Layout},
     ptr::NonNull,
@@ -39,12 +39,12 @@ impl Drop for TestMemory {
 
 #[must_use]
 pub struct Fixture {
-    pub heap: PageHeap<'static>,
+    pub heap: PageHeap,
     pub window: PageWindow,
     free: Vec<bool>,
     // Keep the owned storage alive until after the heap's metadata borrow ends.
     #[allow(dead_code)]
-    metadata: TestMemory,
+    metadata: Vec<TestMemory>,
     #[allow(dead_code)]
     arena: TestMemory,
 }
@@ -52,13 +52,9 @@ pub struct Fixture {
 impl Fixture {
     pub fn new(pages: usize) -> Self {
         let arena = TestMemory::new(Layout::from_size_align(pages * PAGE_SIZE, 65536).unwrap());
-        let metadata = TestMemory::new(Layout::array::<PageOwner>(pages).unwrap());
+        let metadata = Vec::new();
         let window = unsafe { PageWindow::new(arena.ptr, pages) }.unwrap();
-        // Storage remains stable; heap field drops before metadata and arena.
-        // Neither the heap nor its internal 'static borrow may leave this fixture.
-        let owners: &'static mut [PageOwner] =
-            unsafe { std::slice::from_raw_parts_mut(metadata.ptr.as_ptr().cast(), pages) };
-        let heap = unsafe { PageHeap::new(window, owners) }.unwrap();
+        let heap = unsafe { PageHeap::new(window) }.unwrap();
         Self {
             heap,
             window,
@@ -81,7 +77,15 @@ impl Fixture {
             address & (align - 1) == 0 && self.free[*first..*first + pages].iter().all(|f| *f)
         })?;
         self.free[first..first + pages].fill(false);
-        Some(self.window.span(first, pages).unwrap())
+        let span = self.window.span(first, pages).unwrap();
+        let metadata = TestMemory::new(Layout::new::<Area>());
+        let node = metadata.ptr.cast::<Area>();
+        unsafe {
+            node.as_ptr()
+                .write(Area::new(span.start().as_ptr().addr(), pages).unwrap());
+        }
+        self.metadata.push(metadata);
+        Some(unsafe { span.with_area(node) }.unwrap())
     }
 
     pub fn release(&mut self, span: PageSpan) {

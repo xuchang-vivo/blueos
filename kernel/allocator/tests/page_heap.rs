@@ -20,10 +20,6 @@ use support::Fixture;
 
 #[test]
 fn large_run_keeps_all_actual_pages_and_rejects_interior_free() {
-    assert_eq!(
-        std::mem::size_of::<PageOwner>(),
-        2 * std::mem::size_of::<usize>()
-    );
     let mut f = Fixture::new(16);
     let span = f.take(4, 4 * PAGE_SIZE).unwrap();
     let layout = Layout::from_size_align(2 * PAGE_SIZE + 1, 4 * PAGE_SIZE).unwrap();
@@ -149,11 +145,8 @@ fn geometry_rejects_invalid_bounds_and_accepts_object_addresses() {
     assert_eq!(f.window.index_of(end), Err(HeapError::OutOfWindow));
     assert_eq!(f.heap.largest_free_slot(), 0);
     assert_eq!(f.heap.stats(), HeapStats::default());
-    let mut short_owners = [PageOwner::EMPTY; 3];
-    assert!(matches!(
-        unsafe { PageHeap::new(f.window, &mut short_owners) },
-        Err(HeapError::InvalidGeometry)
-    ));
+    let empty = unsafe { PageHeap::new(f.window) }.unwrap();
+    assert_eq!(empty.stats(), HeapStats::default());
 }
 
 #[test]
@@ -615,4 +608,132 @@ fn free_slot_remains_available_when_source_has_no_pages() {
             f.release(span);
         }
     }
+}
+
+#[test]
+fn dynamic_area_indices_preserve_independent_ownership_and_reuse_gaps() {
+    use std::ptr::NonNull;
+    let base = 0x1000_0000;
+    let mut object = AreaIndex::<0>::new();
+    let mut reservations = AreaIndex::<1>::new();
+    let nodes: Vec<_> = (0..127)
+        .map(|i| {
+            NonNull::new(Box::into_raw(Box::new(
+                Area::new(base + i * 2 * PAGE_SIZE, 1).unwrap(),
+            )))
+            .unwrap()
+        })
+        .collect();
+    for k in 0..127 {
+        let node = nodes[(k * 37) % 127];
+        unsafe {
+            object.insert(node).unwrap();
+            reservations.insert(node).unwrap();
+        }
+    }
+    assert_eq!(object.largest_gap(base, base + 254 * PAGE_SIZE), PAGE_SIZE);
+    let mut live = [true; 127];
+    for k in 0..127 {
+        let i = (k * 53) % 127;
+        let start = base + i * 2 * PAGE_SIZE;
+        assert_eq!(object.remove(start), Some(nodes[i]));
+        live[i] = false;
+        for j in 0..127 {
+            assert_eq!(object.find(base + j * 2 * PAGE_SIZE).is_some(), live[j]);
+            assert!(reservations.find(base + j * 2 * PAGE_SIZE).is_some());
+            assert!(object.find(base + j * 2 * PAGE_SIZE + PAGE_SIZE).is_none());
+        }
+    }
+    assert_eq!(
+        object.find_gap(base, base + 254 * PAGE_SIZE, 254 * PAGE_SIZE, PAGE_SIZE),
+        Some(base)
+    );
+    for (i, node) in nodes.into_iter().enumerate() {
+        assert_eq!(reservations.remove(base + i * 2 * PAGE_SIZE), Some(node));
+        unsafe {
+            drop(Box::from_raw(node.as_ptr()));
+        }
+    }
+}
+
+#[test]
+fn area_indices_track_single_members_and_survive_index_moves() {
+    use std::ptr::NonNull;
+    let base = 0x1000_0000;
+    let area = Box::new(Area::new(base, 1).unwrap());
+    let node = NonNull::from(area.as_ref());
+    let mut object = AreaIndex::<0>::new();
+    let mut reservations = AreaIndex::<1>::new();
+    let mut another_object_index = AreaIndex::<0>::new();
+    assert!(unsafe { area.detached() });
+    unsafe {
+        object.insert(node).unwrap();
+        reservations.insert(node).unwrap();
+        assert!(!area.detached());
+        assert_eq!(object.insert(node), Err(HeapError::Conflict));
+        assert_eq!(another_object_index.insert(node), Err(HeapError::Conflict));
+    }
+    // Index headers may move; links must never point into an index header.
+    let mut moved = Box::new(object);
+    assert_eq!(moved.find(base + PAGE_SIZE - 1), Some(node));
+    assert_eq!(moved.find(base + PAGE_SIZE), None);
+    assert_eq!(moved.remove(base + 1), None);
+    assert_eq!(moved.remove(base), Some(node));
+    assert!(unsafe { area.detached() });
+    assert_eq!(reservations.find(base), Some(node));
+    assert_eq!(moved.remove(base), None);
+    unsafe { another_object_index.insert(node).unwrap() };
+    assert_eq!(another_object_index.remove(base), Some(node));
+    assert_eq!(reservations.remove(base), Some(node));
+    assert_eq!(reservations.largest_gap(base, base + PAGE_SIZE), PAGE_SIZE);
+}
+
+#[test]
+fn area_indices_allow_independent_concurrent_indices() {
+    use std::{ptr::NonNull, sync::Barrier, thread};
+    let nodes: Vec<_> = (0..4)
+        .map(|i| Area::new(0x1000_0000 + i * 2 * PAGE_SIZE, 1).unwrap())
+        .collect();
+    let barrier = Barrier::new(2);
+    fn exercise<const I: usize>(nodes: &[Area], barrier: &Barrier) {
+        let mut index = AreaIndex::<I>::new();
+        for _ in 0..4 {
+            for area in nodes.iter().rev() {
+                unsafe { index.insert(NonNull::from(area)).unwrap() };
+            }
+            barrier.wait();
+            for area in nodes {
+                assert_eq!(index.find(area.end - 1), Some(NonNull::from(area)));
+                assert_eq!(index.remove(area.start), Some(NonNull::from(area)));
+            }
+            barrier.wait();
+        }
+    }
+    thread::scope(|scope| {
+        scope.spawn(|| exercise::<0>(&nodes, &barrier));
+        scope.spawn(|| exercise::<1>(&nodes, &barrier));
+    });
+    assert!(nodes.iter().all(|area| unsafe { area.detached() }));
+}
+
+#[test]
+fn large_virtual_window_needs_no_per_page_metadata() {
+    use std::ptr::NonNull;
+    let start = 0xffff800000000000usize;
+    let bytes = 1usize << 46;
+    let window = unsafe {
+        PageWindow::new(
+            NonNull::new(std::ptr::without_provenance_mut(start)).unwrap(),
+            bytes / PAGE_SIZE,
+        )
+    }
+    .unwrap();
+    let heap = unsafe { PageHeap::new(window) }.unwrap();
+    assert_eq!(heap.stats(), HeapStats::default());
+    let areas = AreaIndex::<1>::new();
+    assert_eq!(areas.largest_gap(start, start + bytes), bytes);
+    assert_eq!(
+        areas.find_gap(start, start + bytes, 3 * PAGE_SIZE, 65536),
+        Some(start)
+    );
 }

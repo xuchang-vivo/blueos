@@ -17,12 +17,12 @@ pub mod source;
 mod tests;
 
 use allocator_crate::page_heap::{
-    classify, AllocationPlan, HeapError, HeapStats, PageHeap as RawHeap, PageOwner, PageRequest,
-    PageWindow, ReleaseAction, SlabCommit, PAGE_SIZE,
+    classify, AllocationPlan, HeapError, HeapStats, PageHeap as RawHeap, PageRequest, PageWindow,
+    ReleaseAction, SlabCommit, PAGE_SIZE,
 };
 use core::{alloc::Layout, ptr::NonNull};
 
-use self::source::{FirstFitSource, PageSource, PendingPages};
+use self::source::{PageSource, PendingPages, VmapSource};
 use crate::{mm::paging::FrameStats, sync::SpinLock};
 
 pub(super) fn memory_info_from_frames(stats: FrameStats) -> allocator_crate::MemoryInfo {
@@ -33,14 +33,14 @@ pub(super) fn memory_info_from_frames(stats: FrameStats) -> allocator_crate::Mem
     }
 }
 
-pub struct PageHeap<P: PageSource = FirstFitSource> {
-    state: SpinLock<Option<RawHeap<'static>>>,
+pub struct PageHeap<P: PageSource = VmapSource> {
+    state: SpinLock<Option<RawHeap>>,
     source: P,
 }
 
-impl PageHeap<FirstFitSource> {
+impl PageHeap<VmapSource> {
     pub const fn new() -> Self {
-        Self::with_source(FirstFitSource)
+        Self::with_source(VmapSource)
     }
 }
 
@@ -52,19 +52,13 @@ impl<P: PageSource> PageHeap<P> {
         }
     }
 
-    /// Initialize once with a stable, exclusively owned page ownership table.
+    /// Initialize an empty object heap over its source's virtual window.
     ///
     /// # Safety
-    /// `owners` must remain exclusively borrowed by this heap and must not
-    /// overlap pages returned by the source. The window must cover the source's
-    /// direct-mapped pages, which remain writable until returned to the source.
-    pub unsafe fn init(
-        &self,
-        window: PageWindow,
-        owners: &'static mut [PageOwner],
-    ) -> Result<(), HeapError> {
-        // Clear the ownership table before taking the heap lock.
-        let raw = unsafe { RawHeap::new(window, owners) }?;
+    /// The source must retain exclusive mapped backing and stable descriptors
+    /// for all committed spans until the heap detaches and returns them.
+    pub unsafe fn init(&self, window: PageWindow) -> Result<(), HeapError> {
+        let raw = unsafe { RawHeap::new(window) }?;
         let mut state = self.state.irqsave_lock();
         if state.is_some() {
             return Err(HeapError::Conflict);

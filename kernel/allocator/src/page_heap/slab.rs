@@ -40,7 +40,7 @@ fn slot(span: PageSpan, offset: usize, size: usize, index: usize) -> *mut u8 {
     span.start.as_ptr().wrapping_add(offset + size * index)
 }
 
-impl PageHeap<'_> {
+impl PageHeap {
     /// Formats one exclusively owned page outside the heap lock.
     ///
     /// # Safety
@@ -76,20 +76,16 @@ impl PageHeap<'_> {
         index: usize,
         class: ClassId,
     ) -> Result<(PageSpan, *mut SlabHeader), HeapError> {
-        if self
-            .owners
-            .get(index)
-            .copied()
-            .ok_or(HeapError::CorruptMetadata)?
-            .slab_class()?
-            != Some(class)
+        let address = self.window.span(index, 1)?.start().as_ptr().addr();
+        let node = self.areas.find(address).ok_or(HeapError::CorruptMetadata)?;
+        let area = unsafe { node.as_ref() };
+        if area.start != address
+            || area.end != address + PAGE_SIZE
+            || !matches!(unsafe { area.kind() }, Kind::Slab(c) if c == class)
         {
             return Err(HeapError::CorruptMetadata);
         }
-        let span = self
-            .window
-            .span(index, 1)
-            .map_err(|_| HeapError::CorruptMetadata)?;
+        let span = unsafe { Area::span(node) };
         let h = header(span);
         let (_, slots) = geometry(class)?;
         unsafe {
@@ -208,9 +204,7 @@ impl PageHeap<'_> {
             return Err(HeapError::InvalidRequest);
         }
         let index = self.window.index_of(span.start)?;
-        if !self.owners[index].is_empty() {
-            return Err(HeapError::Conflict);
-        }
+        let area = self.candidate(span)?;
         let (_, slots) = geometry(class)?;
         let h = header(span);
         if (*h).class != class.0 as usize
@@ -253,7 +247,8 @@ impl PageHeap<'_> {
         (*h).free_head = if slots == 1 { END } else { 1 };
         (*h).free_count -= 1;
         (*h).occupied[0] = 1;
-        self.owners[index] = PageOwner::slab(class);
+        self.areas.insert(area)?;
+        area.as_ref().set_kind(Kind::Slab(class));
         if slots > 1 {
             self.link(index, class, h);
         }
@@ -343,7 +338,11 @@ impl PageHeap<'_> {
             if !was_full {
                 self.unlink(class, h);
             }
-            self.owners[index] = PageOwner::EMPTY;
+            let node = self
+                .areas
+                .remove(span.start().as_ptr().addr())
+                .ok_or(HeapError::CorruptMetadata)?;
+            node.as_ref().set_kind(Kind::Empty);
         } else if was_full {
             self.link(index, class, h);
         }

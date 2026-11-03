@@ -239,7 +239,7 @@ pub(crate) fn init_frames(regions: &[crate::mm::memory_bank::MemoryRegion]) {
     // this array, the kernel, stacks and boot table; heap backing follows later.
     unsafe {
         FirstFitFrameAllocator::instance()
-            .init(&regions)
+            .init(regions)
             .expect("failed to initialize FirstFit frame allocator");
     }
 }
